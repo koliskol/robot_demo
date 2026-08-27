@@ -277,16 +277,42 @@ erroring, since the failure mode here is silent (no exception, just a near-black
 `CAMERA_FAR_CLIP_M` (50m) is just tightened from the 1,000,000m default to match this scene's
 actual scale — confirmed not implicated in the near-value breakage above.
 
-**A dark shape filling most of the frame during a deep torso crouch + forward arm swing is the
-robot's own body, not a bug.** Confirmed via a controlled test (driving torso/arms to their
-crouched/forward poses through the same `clamp_to_actual` scheme `main()`'s loop uses, not
-letting them free-fall-settle, then rendering): once the torso is crouched most of the way down
-while the arms are also swung forward, the robot's own torso/shoulder ends up directly in front of
-the head-mounted camera, self-occluding it. Tilting down further makes this **worse**, not
-better — it was tested, and it just puts the torso even more squarely in frame, since the torso is
-now the closest thing to the lens. If the hand still isn't visible, the fix is less torso crouch
-(partial `I`/`K`) relying more on elbow lift (`J`/`L`) to keep the torso out of the camera's line
-of sight — a teleoperation-technique fix, not something tunable via these constants.
+**Two distinct kinds of self-occlusion were found and confirmed, not guessed — don't conflate
+them:**
+- **A dark curved shape intruding into the frame even at rest pose (no crouch, no arm swing) is
+  the camera seeing part of its own head.** Root-caused via a physics raycast (`raycast_closest`
+  from the camera through the exact screen region the shape occupied), not visual guessing: every
+  ray in that region hit `head_link2`'s own collision mesh — the camera mount point sits close
+  enough to the head's own physical shell that its lower edge pokes into the camera's field of
+  view. Fixed by `CAMERA_MOUNT_FORWARD_OFFSET_M` (0.1m along the mount's local +X), confirmed both
+  directions: 0.0 shows the obstruction, +0.1 fully clears it, -0.1 makes it fill most of the
+  frame instead.
+- **A dark shape filling most of the frame during a deep torso crouch + forward arm swing is a
+  separate issue: the robot's own torso/shoulder**, not the head. Confirmed via a controlled test
+  (driving torso/arms to their crouched/forward poses through the same `clamp_to_actual` scheme
+  `main()`'s loop uses, not letting them free-fall-settle, then rendering): once the torso is
+  crouched most of the way down while the arms are also swung forward, the torso/shoulder ends up
+  directly in front of the head-mounted camera. Tilting down further makes this **worse**, not
+  better — it was tested, and it just puts the torso even more squarely in frame, since the torso
+  is now the closest thing to the lens. If the hand still isn't visible, the fix is less torso
+  crouch (partial `I`/`K`) relying more on elbow lift (`J`/`L`) to keep the torso out of the
+  camera's line of sight — a teleoperation-technique fix, not something tunable via these
+  constants, unlike the head-housing case above.
+
+**The head can visibly wobble/tilt in unintended directions during ordinary torso+arm motion —
+not a bug in `HEAD_CAMERA_MOUNT`'s roll/tilt math.** `head_joint1`/`head_joint2` ship with very
+weak PhysX drive stiffness/damping (~2.8/0.001 and ~0.99/0.0004, confirmed live) and, unlike
+every other controlled joint group in this file, nothing commanded them at all until
+`stiffen_head_joints()`/`hold_head_joints()` were added. Live-tested under an aggressive 1s
+full-range torso-crouch + arm-swing stress cycle: uncommanded, the head can swing up to ~36° —
+easily enough to look like the camera itself is tilted sideways rather than down, since the drift
+direction isn't controlled. `stiffen_head_joints()` (called once, before `world.reset()`, raising
+stiffness/damping to 200/20) plus `hold_head_joints()` (called every physics step, same as every
+other joint group, no lead clamp — tested and confirmed one makes no measurable difference here,
+unlike arm/gripper) together cut worst-case drift to ~12° under that same aggressive test; going
+stiffer still (2000/100) barely helped further (~11°), so it isn't pushed beyond 200/20. Real
+teleoperation (not a full-range flip every single second) should see less than this worst case,
+but some residual wobble during fast motion is expected, not eliminated.
 
 **Recording is decoupled from LeRobot on purpose.** `collect_pickplace_demo.py` writes raw
 per-episode data (`manifest.json` + `data.npz` + `frames/*.png`) with zero `lerobot` dependency,

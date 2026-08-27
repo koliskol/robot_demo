@@ -214,6 +214,47 @@ HEAD_CAMERA_MOUNT = (
     "torso_base_link/torso_head_mount_link/head_base_link/head_link1/head_link2/head_end_effector_mount_link"
 )
 
+# head_joint1/head_joint2's own PhysX joint drive (separate from HEAD_CAMERA_MOUNT above, which
+# is the sensor mount several links further out - these are the actual 2-DOF pan/tilt joints)
+# ships with very weak stiffness/damping (~2.8/0.001 and ~0.99/0.0004 respectively, confirmed
+# live) and, unlike every other controlled joint group in this file, nothing ever commands them -
+# live-tested that this lets the head swing up to ~36deg during ordinary torso+arm motion (a 1s
+# full-range torso crouch + arm swing cycle, well within what teleoperating this robot actually
+# does), which is what causes the camera view to visibly tilt in unintended directions - not a
+# bug in HEAD_CAMERA_MOUNT's roll/tilt math (confirmed separately, and correct, via static
+# rendering). See stiffen_head_joints()/hold_head_joints() below for the two-part fix.
+HEAD_JOINT_PATHS = [
+    f"{ROBOT_PRIM}/OmniChassis/base_link/omni_chassis_base_link/omni_chassis_leg_mount_link/leg_base_link/"
+    f"leg_link1/leg_link2/leg_link3/leg_link4/leg_link5/leg_end_effector_mount_link/torso_base_link/Head_Golf/"
+    f"joints/head_joint{i}"
+    for i in (1, 2)
+]
+
+
+def stiffen_head_joints() -> None:
+    """Raise the head joints' PhysX drive stiffness/damping from their very weak defaults, before
+    the articulation is initialized. Live-tested under the same aggressive 1s-cycle stress test
+    referenced above: stiffness/damping 2.8/0.001 -> 200/20 cut max drift from ~36deg (uncommanded)
+    / ~26deg (commanded to hold 0 but with weak drive) down to ~12deg; going stiffer still
+    (2000/100) barely helped further (~11deg) - diminishing returns confirmed, not pushed beyond
+    200/20. This alone doesn't fully solve the wobble - combine with hold_head_joints() below,
+    called every frame in the main loop, same as every other controlled joint group.
+    """
+    for path in HEAD_JOINT_PATHS:
+        drive = UsdPhysics.DriveAPI.Get(get_prim_at_path(path), "angular")
+        drive.GetStiffnessAttr().Set(200.0)
+        drive.GetDampingAttr().Set(20.0)
+
+
+def hold_head_joints(robot: SingleArticulation, head_dof_indices: list) -> None:
+    """Command the head joints to hold their rest pose (0, 0) - call once per physics step, same
+    as every other controlled joint group's per-frame apply_action. No lead clamp here unlike
+    arm/gripper: live-tested it makes no measurable difference (the head has nothing to hit/push
+    against, so there's no contact-instability reason to cap correction speed the way there is
+    for the arm/gripper)."""
+    robot.apply_action(ArticulationAction(joint_positions=np.zeros(2), joint_indices=head_dof_indices))
+
+
 # The mount link's own local frame does not face the robot's forward direction - confirmed live
 # by rendering at identity orientation (showed a sideways, rolled view, not forward) and testing
 # candidate corrections: a +90deg rotation about local X (CAMERA_ROLL_DEG) is what re-aligns it,
@@ -228,6 +269,15 @@ HEAD_CAMERA_MOUNT = (
 CAMERA_ROLL_DEG = 90.0
 CAMERA_TILT_DEG = 15.0
 CAMERA_FOV_DEG = 90.0
+
+# A dark curved shape intruding into the lower part of the frame (live-reported, then confirmed
+# via a physics raycast, not guessed) turned out to be part of the robot's OWN head housing
+# (head_link2's own collision mesh) - the mount point sits close enough to the head's own shell
+# that its lower edge pokes into the camera's own field of view. Pushing the camera forward along
+# the mount's local +X clears it entirely (confirmed live: 0.0 shows the obstruction, +0.1 fully
+# clears it, -0.1 makes it fill most of the frame instead - direction confirmed both ways, not
+# just tested one way and assumed).
+CAMERA_MOUNT_FORWARD_OFFSET_M = 0.1
 
 # Isaac Sim's Camera defaults to a 1.0m NEAR clipping plane (confirmed live via
 # camera.get_clipping_range() - not a documented default anyone would guess) - anything closer
@@ -806,6 +856,7 @@ def main() -> None:
     build_pushcart(stage, "/World/PushCart", x=cart_x, y=cart_y, deck_riser_height=args.deck_riser)
 
     add_reference_to_stage(usd_path=assets_root_path + ROBOT_ASSET, prim_path=ROBOT_PRIM)
+    stiffen_head_joints()
     robot_spawn_x = table_aabb[0] - ROBOT_APPROACH_GAP_M
     robot_spawn_y = (table_center_y + cart_y) / 2.0  # centered between table and cart
     place_on_ground(bbox_cache, ROBOT_PRIM, x=robot_spawn_x, y=robot_spawn_y)
@@ -873,7 +924,8 @@ def main() -> None:
     aperture = camera.get_horizontal_aperture()
     camera.set_focal_length(float(aperture / (2.0 * np.tan(np.radians(CAMERA_FOV_DEG) / 2.0))))
     camera.set_local_pose(
-        translation=np.array([0.0, 0.0, 0.0]), orientation=camera_head_mount_quat(CAMERA_ROLL_DEG, CAMERA_TILT_DEG)
+        translation=np.array([CAMERA_MOUNT_FORWARD_OFFSET_M, 0.0, 0.0]),
+        orientation=camera_head_mount_quat(CAMERA_ROLL_DEG, CAMERA_TILT_DEG),
     )
     camera.set_clipping_range(near_distance=CAMERA_NEAR_CLIP_M, far_distance=CAMERA_FAR_CLIP_M)
 
@@ -890,6 +942,7 @@ def main() -> None:
     leg_indices = leg_dof_indices(robot)
     left_gripper_dof_indices = gripper_dof_indices(robot, "left")
     right_gripper_dof_indices = gripper_dof_indices(robot, "right")
+    head_dof_indices = [robot.get_dof_index("head_joint1"), robot.get_dof_index("head_joint2")]
 
     state_dof_indices = np.array(
         left_arm_dof_indices + right_arm_dof_indices + leg_indices + left_gripper_dof_indices + right_gripper_dof_indices
@@ -1097,6 +1150,8 @@ def main() -> None:
         right_gripper_q = clamp_to_actual(np.array([gripper_rad]), actual_q[right_gripper_dof_indices], max_lead=GRIPPER_MAX_LEAD_RAD)
         robot.apply_action(ArticulationAction(joint_positions=left_gripper_q, joint_indices=left_gripper_dof_indices))
         robot.apply_action(ArticulationAction(joint_positions=right_gripper_q, joint_indices=right_gripper_dof_indices))
+
+        hold_head_joints(robot, head_dof_indices)
 
         world.step(render=True)
 
