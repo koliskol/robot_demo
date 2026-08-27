@@ -121,27 +121,46 @@ here too). It drops WebRTC/lidar/depth entirely (not needed for offline data col
 adds a pushcart (`build_pushcart`, ported from `capture_cube_rgbd.py`) placed **adjacent** to the
 table rather than across the room, so the task is pure fixed-base arm/gripper/torso manipulation
 — no driving during an episode, no base pose in the recorded state/action space (21 dims: both
-7-DOF arms, 5-DOF torso, both grippers). `--cube-start {table,cart}` controls where the cube
+7-DOF arms, 5-DOF torso, both grippers). `--cube-start {table,cart}` controls where the box
 spawns on reset — run one recording session per value to collect both directions (table→cart and
 cart→table); the task name recorded in each episode's manifest defaults accordingly unless
-`--task` overrides it.
+`--task` overrides it. On table-start sessions, two extra bigger boxes spawn by default
+(`--cube2-scale`/`--cube3-scale`, `--no-extra-boxes` to disable) as real pick-up targets for size
+variety — not on cart-start sessions, since the pushcart deck (`PUSHCART_DECK_HALF_EXTENT`) is
+too small to fit 3 boxes side by side. None of this is tracked in the recorded state/action
+(robot-only, 21 dims) — box choice only affects what the camera sees, the same way varying
+`--cube-scale` across sessions would.
+
+**Boxes are real assets, not procedural cubes.** `spawn_real_box()` references two physics-ready
+box assets from Isaac's YCB set (`BOX_ASSET_MAIN` = a cracker box, `BOX_ASSET_EXTRA` = a sugar
+box — both confirmed live to already carry `RigidBodyAPI`/`MassAPI`), overriding only their mass
+to task-appropriate values; `BOX_ASSET_MAIN` is reused at a bigger scale for the third box, since
+only two physics-ready box-shaped assets exist in this asset library version. `place_on_surface`/
+`scaled_footprint` extend `place_on_ground`'s scale-then-measure trick to rest something on an
+arbitrary surface height (a tabletop or cart deck) and to measure a scaled footprint without
+moving the prim — both must be called only once per prim, at its just-referenced identity
+transform, or the measurement is wrong (see their docstrings). Friction is left at each asset's
+own baked-in default for now — not overridden with a custom `PhysicsMaterial`, since that would
+mix the `isaacsim.core.api` (legacy) and `isaacsim.core.experimental` physics-material APIs
+without live verification; that's the next lever if the hug hold proves unreliable, not a
+kinematic attach.
 
 **The central open risk is holding the object itself.** Neither this project nor
 `capture_cube_rgbd.py` has ever demonstrated actually lifting and carrying a loose object — only
 pinching a fixed obstacle or a heavy pushcart handle. The chosen approach is a bimanual **hug**
 (both arms swinging forward via `U` to compress the box between the forearms) rather than a
-single gripper's fingertip pinch — hence `--cube-size` defaulting to 0.22m, sized for that, not
-for a gripper's grasp margin; gripper open/close (`M`/`N`) is optional extra contact, not the
-primary hold. This is still friction-only contact, so the same constraint applies as would have
-applied to a gripper pinch: `capture_cube_rgbd.py`'s own comments record that every *kinematic*
-grasp assist tried on this hand link (a hand-authored `FixedJoint`, Isaac Sim's
-`IsaacSurfaceGripper`) reproducibly destabilized the whole robot, because the hand is an
-actively-driven articulation link, not a simple jointed body. Never grow a joint-based/kinematic
-attach mechanism to stabilize the hug — if it proves unreliable, the fix space is cube
-size/mass/friction and arm swing-in distance, not a new attach primitive. Run through one full
-pick/place/pick/place cycle by hand (see the script's module docstring, "Stage 0") before
-trusting any recorded data — in particular, confirm both arms can actually converge around the
-box from a single parked robot pose without repositioning.
+single gripper's fingertip pinch — hence real box assets sized well beyond a gripper's grasp
+margin; gripper open/close (`M`/`N`) is optional extra contact, not the primary hold. This is
+still friction-only contact, so the same constraint applies as would have applied to a gripper
+pinch: `capture_cube_rgbd.py`'s own comments record that every *kinematic* grasp assist tried on
+this hand link (a hand-authored `FixedJoint`, Isaac Sim's `IsaacSurfaceGripper`) reproducibly
+destabilized the whole robot, because the hand is an actively-driven articulation link, not a
+simple jointed body. Never grow a joint-based/kinematic attach mechanism to stabilize the hug —
+if it proves unreliable, the fix space is box mass/scale/friction and arm swing-in distance, not
+a new attach primitive. Run through one full pick/place/pick/place cycle by hand (see the
+script's module docstring, "Stage 0") before trusting any recorded data — in particular, confirm
+both arms can actually converge around the box from a single parked robot pose without
+repositioning.
 
 **Cart deck height is a tunable, not a constant**: the pushcart's stock deck sits ~0.15m off the
 floor (designed for "push by the handle," not "place a box here"), almost certainly well below
