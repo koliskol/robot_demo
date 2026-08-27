@@ -131,19 +131,28 @@ too small to fit 3 boxes side by side. None of this is tracked in the recorded s
 (robot-only, 21 dims) — box choice only affects what the camera sees, the same way varying
 `--cube-scale` across sessions would.
 
-**Boxes are real assets, not procedural cubes.** `spawn_real_box()` references two physics-ready
-box assets from Isaac's YCB set (`BOX_ASSET_MAIN` = a cracker box, `BOX_ASSET_EXTRA` = a sugar
-box — both confirmed live to already carry `RigidBodyAPI`/`MassAPI`), overriding only their mass
-to task-appropriate values; `BOX_ASSET_MAIN` is reused at a bigger scale for the third box, since
-only two physics-ready box-shaped assets exist in this asset library version. `place_on_surface`/
-`scaled_footprint` extend `place_on_ground`'s scale-then-measure trick to rest something on an
-arbitrary surface height (a tabletop or cart deck) and to measure a scaled footprint without
-moving the prim — both must be called only once per prim, at its just-referenced identity
-transform, or the measurement is wrong (see their docstrings). Friction is left at each asset's
-own baked-in default for now — not overridden with a custom `PhysicsMaterial`, since that would
-mix the `isaacsim.core.api` (legacy) and `isaacsim.core.experimental` physics-material APIs
-without live verification; that's the next lever if the hug hold proves unreliable, not a
-kinematic attach.
+**Boxes are real warehouse cardboard-box assets, not procedural cubes.** `spawn_real_box()`
+references three distinct real box props from Isaac's warehouse/logistics environment set
+(`BOX_ASSET_MAIN`/`CUBE2`/`CUBE3` — generic shipping boxes, sized ~0.38m/0.50m/0.70m). Unlike an
+earlier iteration using Isaac's YCB grocery-item assets (which already carried
+`RigidBodyAPI`/`MassAPI`), these warehouse props ship as **static, collision-only meshes** —
+confirmed live: the mesh's collision approximation defaults to `"none"` (an exact triangle mesh),
+which PhysX accepts for a static collider but rejects for a *dynamic* rigid body. `make_box_dynamic()`
+explicitly authors `RigidBodyAPI`+`MassAPI` on the root and overrides the mesh's collision
+approximation to `convexHull` (tested live: all three settle cleanly under gravity with negligible
+drift, no instability) — any new real-asset prop added to this scene needs the same treatment
+unless it's independently confirmed to already ship with dynamic-body-compatible physics.
+`place_on_surface`/`scaled_footprint` extend `place_on_ground`'s scale-then-measure trick to rest
+something on an arbitrary surface height (a tabletop or cart deck) and to measure a scaled
+footprint without moving the prim — both must be called only once per prim, at its
+just-referenced identity transform, or the measurement is wrong (see their docstrings). Friction
+is left at each asset's own baked-in default for now — not overridden with a custom
+`PhysicsMaterial`, since that would mix the `isaacsim.core.api` (legacy) and
+`isaacsim.core.experimental` physics-material APIs without live verification; that's the next
+lever if the hug hold proves unreliable, not a kinematic attach. `BOX_ASSET_MAIN` (the smallest,
+CardBoxD) was deliberately chosen small enough to also fit the pushcart deck; `CUBE2`/`CUBE3` are
+table-only and `CUBE3`'s 0.7m width leaves only ~0.05m margin against the table's 0.8m x-extent
+(confirmed live, not just estimated) — reduce `--cube3-scale` if the table asset ever changes.
 
 **The central open risk is holding the object itself.** Neither this project nor
 `capture_cube_rgbd.py` has ever demonstrated actually lifting and carrying a loose object — only

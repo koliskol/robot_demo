@@ -34,7 +34,8 @@ IMPORTANT - read before collecting any real data: this task requires holding and
 object, which neither this project nor ../Robot_project/capture_cube_rgbd.py has ever
 demonstrated. The chosen approach is a bimanual "hug" - both arms swinging forward (U) to
 compress the box between the forearms, rather than a single gripper's fingertip pinch - so the
-boxes (real YCB box assets, see BOX_ASSET_MAIN/BOX_ASSET_EXTRA below - not procedural cubes) are
+boxes (real warehouse cardboard-box assets, see BOX_ASSET_MAIN/CUBE2/CUBE3 below - not procedural
+cubes) are
 sized bigger than a gripper-sized grasp would need. This is still friction-only contact, same
 constraint as a gripper pinch would have been: ../Robot_project/capture_cube_rgbd.py's own
 history records that every *kinematic* grasp-assist attempt (a hand-authored FixedJoint, and
@@ -79,8 +80,9 @@ parser.add_argument(
     "--cube-scale",
     type=float,
     default=1.0,
-    help="Uniform scale multiplier for the main box (a real cracker-box asset, see BOX_ASSET_MAIN "
-    "- native footprint is roughly 0.16 x 0.21 x 0.07m at scale 1.0).",
+    help="Uniform scale multiplier for the main box (a real warehouse cardboard-box asset, see "
+    "BOX_ASSET_MAIN - native footprint is roughly 0.38 x 0.25 x 0.15m at scale 1.0, small enough "
+    "to also fit the pushcart deck).",
 )
 parser.add_argument(
     "--cube-mass",
@@ -92,19 +94,20 @@ parser.add_argument(
 parser.add_argument(
     "--cube2-scale",
     type=float,
-    default=1.5,
-    help="Scale multiplier for a second, bigger box (a real sugar-box asset, see BOX_ASSET_EXTRA "
-    "- native footprint is roughly 0.09 x 0.18 x 0.05m at scale 1.0). Table-side only.",
+    default=1.0,
+    help="Scale multiplier for a second, bigger box (a distinct real cardboard-box asset, see "
+    "BOX_ASSET_CUBE2 - native footprint is roughly 0.50 x 0.50 x 0.25m at scale 1.0). Table-side only.",
 )
-parser.add_argument("--cube2-mass", type=float, default=0.22, help="Mass of the second box in kg.")
+parser.add_argument("--cube2-mass", type=float, default=0.25, help="Mass of the second box in kg.")
 parser.add_argument(
     "--cube3-scale",
     type=float,
-    default=1.3,
-    help="Scale multiplier for a third, even bigger box (reuses BOX_ASSET_MAIN, the cracker-box "
-    "asset, at a larger scale than the main box). Table-side only.",
+    default=1.0,
+    help="Scale multiplier for a third, even bigger box (a distinct real cardboard-box asset, see "
+    "BOX_ASSET_CUBE3 - native footprint is roughly 0.70 x 0.50 x 0.50m at scale 1.0, the biggest). "
+    "Table-side only.",
 )
-parser.add_argument("--cube3-mass", type=float, default=0.30, help="Mass of the third box in kg.")
+parser.add_argument("--cube3-mass", type=float, default=0.35, help="Mass of the third box in kg.")
 parser.add_argument(
     "--extra-boxes",
     dest="extra_boxes",
@@ -154,14 +157,19 @@ TABLE_ASSET = "/Isaac/Environments/Office/Props/SM_TableB.usd"
 ROBOT_ASSET = "/Isaac/Robots/Galbot/galbot_g1/galbot_g1.usda"
 ROBOT_PRIM = "/World/Robot"
 
-# Real box assets (Isaac's YCB set) instead of procedural cubes - both confirmed live to already
-# carry RigidBodyAPI + MassAPI (see spawn_real_box, which overrides the mass to task-appropriate
-# values but leaves collision/rigid-body setup as authored). Native footprints (x,y,z meters,
-# measured via a live AABB probe at scale 1.0): cracker box ~(0.164, 0.213, 0.072), sugar box
-# ~(0.093, 0.176, 0.045). BOX_ASSET_MAIN is reused (at a bigger scale) for the third/biggest box
-# too - only two physics-ready box-shaped assets exist in this asset library version.
-BOX_ASSET_MAIN = "/Isaac/Props/YCB/Axis_Aligned_Physics/003_cracker_box.usd"
-BOX_ASSET_EXTRA = "/Isaac/Props/YCB/Axis_Aligned_Physics/004_sugar_box.usd"
+# Real cardboard-box props from Isaac's warehouse/logistics environment set (plain generic
+# shipping boxes, not branded grocery items) - see spawn_real_box/make_box_dynamic below for why
+# these need extra physics authoring these ship as static (collision-only) meshes, unlike the
+# earlier YCB grocery-box assets this replaced. Native footprints (x,y,z meters, measured via a
+# live AABB probe at scale 1.0): CardBoxD ~(0.38, 0.25, 0.15), CardBoxC ~(0.50, 0.50, 0.25),
+# CardBoxA ~(0.70, 0.50, 0.50). BOX_ASSET_MAIN is the smallest so it also fits the pushcart deck
+# (0.6 x 0.45m) on --cube-start=cart sessions; CUBE2/CUBE3 are table-side only (see
+# --extra-boxes) and are genuinely different assets, not the same one rescaled. The table itself
+# is 0.8m x 2.8m (x,y) - CardBoxA's 0.7m width leaves only ~0.05m margin on the table's x-axis,
+# worth checking visually (Stage-panel + F) rather than assuming it clears.
+BOX_ASSET_MAIN = "/Isaac/Environments/Simple_Warehouse/Props/SM_CardBoxD_01.usd"
+BOX_ASSET_CUBE2 = "/Isaac/Environments/Simple_Warehouse/Props/SM_CardBoxC_01.usd"
+BOX_ASSET_CUBE3 = "/Isaac/Environments/Simple_Warehouse/Props/SM_CardBoxA_01.usd"
 
 # Room footprint (meters, world xy) - unrelated to the pick-place task itself, just needs to be
 # large enough to contain the table/cart/robot cluster (which is now built around the origin,
@@ -374,22 +382,39 @@ def scaled_footprint(bbox_cache, prim_path: str, scale: float) -> np.ndarray:
     return compute_world_aabb(bbox_cache, prim_path) * scale
 
 
+def make_box_dynamic(prim_path: str, mass: float) -> None:
+    """Author RigidBodyAPI + MassAPI on a referenced box prop's root, and override its mesh
+    child's collision approximation to convexHull. The warehouse cardboard-box props this is used
+    for (BOX_ASSET_MAIN/CUBE2/CUBE3) ship as static, collision-only meshes - confirmed live: the
+    mesh's collision approximation defaults to "none" (an exact triangle mesh), which PhysX
+    accepts for a static collider but rejects for a *dynamic* rigid body - only convex shapes are
+    valid there. convexHull is a safe choice for a box-shaped mesh (tested live: settles cleanly
+    under gravity from a 1m drop, no NaN/instability, <1mm of settling drift). `Apply()` is a
+    no-op if an API is already present, so this is safe to call even on an asset that already had
+    physics authored.
+    """
+    prim = get_prim_at_path(prim_path)
+    UsdPhysics.RigidBodyAPI.Apply(prim)
+    UsdPhysics.MassAPI.Apply(prim).CreateMassAttr(mass)
+    mesh_prim = next((c for c in prim.GetAllChildren() if c.GetTypeName() == "Mesh"), None)
+    if mesh_prim is not None:
+        UsdPhysics.CollisionAPI.Apply(mesh_prim)
+        UsdPhysics.MeshCollisionAPI.Apply(mesh_prim).CreateApproximationAttr("convexHull")
+
+
 def spawn_real_box(
     bbox_cache, assets_root_path: str, usd_relpath: str, prim_path: str, x: float, y: float, surface_z: float, scale: float, mass: float
 ) -> np.ndarray:
-    """Reference a physics-ready real box asset (see BOX_ASSET_MAIN/BOX_ASSET_EXTRA - both
-    confirmed to already carry RigidBodyAPI + MassAPI) and place it resting on `surface_z`,
-    overriding its authored mass to `mass` kg (the asset's own baked-in mass isn't necessarily
-    tuned for this task's friction-only hug hold). Friction is left at the asset's own baked-in
-    default for now - not yet worth the risk of mixing the isaacsim.core.api (legacy) and
-    isaacsim.core.experimental physics-material APIs without live verification; if the hug hold
-    proves unreliable, binding a custom high-friction PhysicsMaterial here is the next thing to
-    try, not a kinematic attach (see the module docstring).
+    """Reference a real box asset (see BOX_ASSET_MAIN/CUBE2/CUBE3), make it a dynamic rigid body
+    (see make_box_dynamic), and place it resting on `surface_z`. Friction is left at the asset's
+    own baked-in default for now - not yet worth the risk of mixing the isaacsim.core.api (legacy)
+    and isaacsim.core.experimental physics-material APIs without live verification; if the hug
+    hold proves unreliable, binding a custom high-friction PhysicsMaterial here is the next thing
+    to try, not a kinematic attach (see the module docstring).
     """
     add_reference_to_stage(usd_path=assets_root_path + usd_relpath, prim_path=prim_path)
-    aabb = place_on_surface(bbox_cache, prim_path, x=x, y=y, surface_z=surface_z, scale=scale)
-    UsdPhysics.MassAPI(get_prim_at_path(prim_path)).GetMassAttr().Set(mass)
-    return aabb
+    make_box_dynamic(prim_path, mass)
+    return place_on_surface(bbox_cache, prim_path, x=x, y=y, surface_z=surface_z, scale=scale)
 
 
 # Pushcart geometry - ported from ../Robot_project/capture_cube_rgbd.py's build_pushcart, with
@@ -639,24 +664,25 @@ def main() -> None:
     if args.extra_boxes and args.cube_start == "table":
         main_half_dy = (main_box_aabb[4] - main_box_aabb[1]) / 2.0
 
-        add_reference_to_stage(usd_path=assets_root_path + BOX_ASSET_EXTRA, prim_path="/World/Cube2")
+        add_reference_to_stage(usd_path=assets_root_path + BOX_ASSET_CUBE2, prim_path="/World/Cube2")
+        make_box_dynamic("/World/Cube2", args.cube2_mass)
         cube2_footprint = scaled_footprint(bbox_cache, "/World/Cube2", args.cube2_scale)
         cube2_half_dy = (cube2_footprint[4] - cube2_footprint[1]) / 2.0
         cube2_y = table_center_y + main_half_dy + CUBE_ROW_GAP_M + cube2_half_dy
         place_on_surface(bbox_cache, "/World/Cube2", x=table_center_x, y=cube2_y, surface_z=table_top_z, scale=args.cube2_scale)
-        UsdPhysics.MassAPI(get_prim_at_path("/World/Cube2")).GetMassAttr().Set(args.cube2_mass)
 
-        add_reference_to_stage(usd_path=assets_root_path + BOX_ASSET_MAIN, prim_path="/World/Cube3")
+        add_reference_to_stage(usd_path=assets_root_path + BOX_ASSET_CUBE3, prim_path="/World/Cube3")
+        make_box_dynamic("/World/Cube3", args.cube3_mass)
         cube3_footprint = scaled_footprint(bbox_cache, "/World/Cube3", args.cube3_scale)
         cube3_half_dy = (cube3_footprint[4] - cube3_footprint[1]) / 2.0
         cube3_y = table_center_y - main_half_dy - CUBE_ROW_GAP_M - cube3_half_dy
         place_on_surface(bbox_cache, "/World/Cube3", x=table_center_x, y=cube3_y, surface_z=table_top_z, scale=args.cube3_scale)
-        UsdPhysics.MassAPI(get_prim_at_path("/World/Cube3")).GetMassAttr().Set(args.cube3_mass)
 
         print(
-            f"[geometry] cube2 (sugar box) half_dy={cube2_half_dy:.3f}m at y={cube2_y:.3f}  "
-            f"cube3 (cracker box) half_dy={cube3_half_dy:.3f}m at y={cube3_y:.3f}  "
-            f"(check none hang off the table edge - Stage-panel + F on /World/Cube2, /World/Cube3 to verify)"
+            f"[geometry] cube2 (CardBoxC) half_dy={cube2_half_dy:.3f}m at y={cube2_y:.3f}  "
+            f"cube3 (CardBoxA) half_dy={cube3_half_dy:.3f}m at y={cube3_y:.3f}  "
+            f"(check none hang off the table edge, esp. x-axis for cube3 - Stage-panel + F on "
+            f"/World/Cube2, /World/Cube3 to verify)"
         )
 
     camera = Camera(

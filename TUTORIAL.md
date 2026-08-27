@@ -47,19 +47,23 @@ Things to check, and what to do if they fail:
 
 | Problem | Fix |
 |---|---|
-| Box not visible in the viewport | Select `/World/Cube` in the Stage panel, press `F` to frame it. It's a real box asset (cracker box) now, not a tiny procedural cube - `--cube-scale` resizes it (default 1.0 = native size, ~0.16 x 0.21 x 0.07m). |
+| Box not visible in the viewport | Select `/World/Cube` in the Stage panel, press `F` to frame it. It's a real warehouse cardboard-box asset now, not a tiny procedural cube - `--cube-scale` resizes it (default 1.0 = native size, ~0.38 x 0.25 x 0.15m). |
 | Arms can't reach low/close enough to grip on the table, or can't clear the cart deck | Relaunch with a different `--deck-riser <meters>` (raises the cart deck without touching its wheels). |
 | The two arms don't converge enough around the box to hold it | This needs adjusting `ARM_FORWARD_POSE`'s shoulder angle in the script — a code change, not a CLI flag. Note how far off it is and we can tune it. |
 | Robot body collides with table/cart, or can't reach at all | Adjust `ROBOT_APPROACH_GAP_M`/`CART_TABLE_GAP_M` constants near the top of the script. |
 | Hold is unstable / box flies out of the hug | Lower `--cube-mass`, or bind a custom high-friction `PhysicsMaterial` onto the box (not done by default - see `spawn_real_box`'s docstring), before trying anything more exotic. Do **not** add a joint-based attach — see `CLAUDE.md`. |
 
-The boxes are real box assets (Isaac's YCB set: a cracker box and a sugar box), not plain colored
-cubes, each with its own baked-in collision/rigid-body setup. A decorative second table sits far
-across the room — it's not part of the task, ignore it during this check. On `--cube-start table`
-sessions, two extra bigger boxes (`--cube2-scale`/`--cube3-scale`, default 1.5x/1.3x, spaced apart
-via `CUBE_ROW_GAP_M`) also spawn alongside the main one, for size variety — these are real pick-up
-targets too, not decoration; pass `--no-extra-boxes` for just the single box. They don't spawn on
-`--cube-start cart` sessions (the pushcart deck is too small to fit 3 boxes).
+The boxes are real cardboard-box props from Isaac's warehouse/logistics asset set (generic
+shipping boxes, not branded items) — plain colored cubes were dropped entirely. These ship as
+static (collision-only) meshes, so `make_box_dynamic()` explicitly authors rigid-body physics and
+overrides their mesh collision to `convexHull` (verified live: settles cleanly under gravity, no
+instability). A decorative second table sits far across the room — it's not part of the task,
+ignore it during this check. On `--cube-start table` sessions, two extra bigger boxes (distinct
+real assets, `--cube2-scale`/`--cube3-scale` to resize further, spaced apart via `CUBE_ROW_GAP_M`)
+also spawn alongside the main one, for size variety — these are real pick-up targets too, not
+decoration; pass `--no-extra-boxes` for just the single box. They don't spawn on `--cube-start
+cart` sessions (the pushcart deck is too small to fit 3 boxes) — the main box alone is small
+enough to fit the deck (confirmed: 0.38m fits within the deck's 0.6m width).
 
 Do not move on to real recording until one full pick → place → pick → place cycle works reliably.
 
