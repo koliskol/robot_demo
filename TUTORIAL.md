@@ -25,9 +25,14 @@ a tunable, why conversion runs in a separate environment). This document is the 
 (`streaming_server.py`), streaming just the RGB feed (no depth/lidar/map — this task doesn't use
 those sensors, so those panels on the browser page just stay blank). Open
 `http://<this machine's address>:8080/` (or whatever `--host`/`--port` you passed) and click
-Connect to watch live while teleoperating. This is purely for convenience — it has no effect on
-what actually gets recorded (the recorder samples the same camera independently, at a fixed rate,
-regardless of whether anyone's watching the stream).
+Connect to watch live while teleoperating.
+
+Below the video, a status bar appears (idle / recording / awaiting label, with episode number and
+frame count) along with **Start Recording / Success (Y) / Fail (F) / Discard** buttons — these
+drive the exact same recorder as the `B`/`Y`/`F`/`Backspace` keys, so you can control recording
+from the browser instead of (or alongside) the keyboard. Watching the stream itself is still
+purely for convenience either way — it has no effect on what actually gets recorded (the recorder
+samples the same camera independently, at a fixed rate, regardless of whether anyone's watching).
 
 ## Step 0 — smoke test before recording anything real
 

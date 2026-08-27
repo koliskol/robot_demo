@@ -6,6 +6,50 @@ const connectBtn = document.getElementById("connect");
 const rgbVideo = document.getElementById("rgb");
 const depthVideo = document.getElementById("depth");
 
+const recorderBar = document.getElementById("recorder-bar");
+const recorderBadge = document.getElementById("recorder-badge");
+const recordToggleBtn = document.getElementById("record-toggle");
+const labelSuccessBtn = document.getElementById("label-success");
+const labelFailBtn = document.getElementById("label-fail");
+const labelDiscardBtn = document.getElementById("label-discard");
+
+// Set by connect() once the peer connection exists - the button handlers below are wired once,
+// up front, and just no-op (via the readyState guard in sendControl) until a connection with an
+// open "control" channel actually exists.
+let controlChannel = null;
+
+function sendControl(message) {
+  if (controlChannel && controlChannel.readyState === "open") {
+    controlChannel.send(JSON.stringify(message));
+  }
+}
+
+recordToggleBtn.addEventListener("click", () => sendControl({ action: "toggle_record" }));
+labelSuccessBtn.addEventListener("click", () => sendControl({ action: "label", value: "success" }));
+labelFailBtn.addEventListener("click", () => sendControl({ action: "label", value: "fail" }));
+labelDiscardBtn.addEventListener("click", () => sendControl({ action: "discard" }));
+
+// Only ever called if the server actually sends a "status" message (see build_app in
+// streaming_server.py) - a page whose script never calls FrameStore.update_status (e.g.
+// stream_demo.py) leaves recorder-bar hidden forever, which is the point.
+function updateRecorderStatus(status) {
+  recorderBar.style.display = "flex";
+  const state = status.state; // "IDLE" | "RECORDING" | "AWAITING_LABEL"
+  recorderBadge.className = state === "RECORDING" ? "recording" : state === "AWAITING_LABEL" ? "awaiting-label" : "";
+  recorderBadge.textContent =
+    state === "RECORDING"
+      ? `recording (ep ${status.episode_index}, ${status.num_frames} frames)`
+      : state === "AWAITING_LABEL"
+      ? `awaiting label (ep ${status.episode_index}, ${status.num_frames} frames)`
+      : "idle";
+  recordToggleBtn.textContent = state === "RECORDING" ? "Stop Recording" : "Start Recording";
+  recordToggleBtn.disabled = state === "AWAITING_LABEL";
+  const awaitingLabel = state === "AWAITING_LABEL";
+  labelSuccessBtn.disabled = !awaitingLabel;
+  labelFailBtn.disabled = !awaitingLabel;
+  labelDiscardBtn.disabled = !awaitingLabel;
+}
+
 connectBtn.addEventListener("click", () => {
   connectBtn.disabled = true;
   connect().catch((err) => {
@@ -33,6 +77,14 @@ async function connect() {
 
   const mapChannel = pc.createDataChannel("worldmap");
   mapChannel.onmessage = (msg) => updateMap(JSON.parse(msg.data));
+
+  const statusChannel = pc.createDataChannel("status");
+  statusChannel.onmessage = (msg) => updateRecorderStatus(JSON.parse(msg.data));
+
+  // Same "client creates it" reasoning as the others, but this one's the reverse direction: we
+  // send on it (see sendControl above), the server just listens (see build_app's on_datachannel
+  // in streaming_server.py).
+  controlChannel = pc.createDataChannel("control");
 
   const videoEls = [rgbVideo, depthVideo];
   let nextVideoIndex = 0;

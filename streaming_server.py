@@ -38,6 +38,8 @@ class FrameStore:
         self._depth: np.ndarray | None = None
         self._points: np.ndarray | None = None
         self._world_state: dict | None = None
+        self._status: dict | None = None
+        self._commands: list[dict] = []
 
     def update_rgb(self, rgb: np.ndarray) -> None:
         with self._lock:
@@ -75,6 +77,39 @@ class FrameStore:
     def get_world_state(self) -> dict | None:
         with self._lock:
             return self._world_state
+
+    def update_status(self, status: dict) -> None:
+        """Arbitrary small JSON-able status dict (e.g. a recorder's state/episode/frame-count in
+        collect_pickplace_demo.py) sent to the browser as JSON over the "status" data channel,
+        for a UI element like a status badge. Generic on purpose - this module has no concept of
+        "recording"; the consuming script decides what goes in the dict, same as
+        update_world_state's room/objects/robot shape is stream_demo.py's own concept, not this
+        module's.
+        """
+        with self._lock:
+            self._status = status
+
+    def get_status(self) -> dict | None:
+        with self._lock:
+            return self._status
+
+    def push_command(self, command: dict) -> None:
+        """Queue a command received from the browser's "control" data channel (see build_app's
+        on_datachannel) - e.g. a button click - for the sim loop to pick up via pop_commands().
+        Generic on purpose, same rationale as update_status: this module doesn't interpret
+        command contents, just relays them.
+        """
+        with self._lock:
+            self._commands.append(command)
+
+    def pop_commands(self) -> list[dict]:
+        """Drain and return all commands queued since the last call - call this once per sim loop
+        iteration (see collect_pickplace_demo.py) rather than polling get_status-style, so a
+        command sent between two slow frames isn't silently dropped or double-counted.
+        """
+        with self._lock:
+            commands, self._commands = self._commands, []
+            return commands
 
 
 DEPTH_MIN_M = 0.0
@@ -175,6 +210,23 @@ async def _send_world_state(channel, frame_store: FrameStore, hz: float = 10.0) 
         await asyncio.sleep(interval)
 
 
+async def _send_status(channel, frame_store: FrameStore, hz: float = 5.0) -> None:
+    """Generic small JSON status blob (see FrameStore.update_status) - low rate, since a status
+    badge doesn't need to update at anywhere near video framerate. Only ever sends something if
+    the consuming script (e.g. collect_pickplace_demo.py) actually calls update_status(); a
+    script that never does (e.g. stream_demo.py) leaves this channel silent, which is what keeps
+    static/index.html's status UI hidden for it (see viewer.js).
+    """
+    interval = 1.0 / hz
+    while channel.readyState == "connecting":
+        await asyncio.sleep(0.05)
+    while channel.readyState == "open":
+        status = frame_store.get_status()
+        if status is not None:
+            channel.send(json.dumps(status))
+        await asyncio.sleep(interval)
+
+
 def build_app(frame_store: FrameStore) -> web.Application:
     pcs: set[RTCPeerConnection] = set()
 
@@ -214,6 +266,20 @@ def build_app(frame_store: FrameStore) -> web.Application:
                 asyncio.ensure_future(_send_point_cloud(channel, frame_store))
             elif channel.label == "worldmap":
                 asyncio.ensure_future(_send_world_state(channel, frame_store))
+            elif channel.label == "status":
+                asyncio.ensure_future(_send_status(channel, frame_store))
+            elif channel.label == "control":
+                # Reverse direction from the others - the browser sends, we just relay each
+                # message into frame_store for the sim loop to pick up via pop_commands().
+                # Malformed JSON is dropped rather than raised, since this callback runs inside
+                # aiortc's own event loop - an uncaught exception here would surface as an
+                # unhelpful asyncio traceback, not a clean error back to the browser.
+                @channel.on("message")
+                def on_control_message(message) -> None:
+                    try:
+                        frame_store.push_command(json.loads(message))
+                    except (json.JSONDecodeError, TypeError):
+                        pass
 
         await pc.setRemoteDescription(rtc_offer)
         answer = await pc.createAnswer()

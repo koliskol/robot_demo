@@ -66,7 +66,7 @@ camera, not a buffered stream. A slow client just sees fewer/staler frames, neve
 backlog. `streaming_server.py` has no `import isaacsim` anywhere, which is what makes it
 standalone-runnable for testing the viewer without Isaac Sim.
 
-**Four data paths to the browser, each shaped differently:**
+**Six data paths to the browser, each shaped differently:**
 - RGB and depth are separate WebRTC video tracks (`RGBTrack`, `DepthTrack`). Depth is
   false-colored (`_depth_to_rgb`: blue near → green mid → grey far, fixed 0–20m scale so a color
   always means the same distance across frames) — exact float depth is never sent anywhere.
@@ -76,16 +76,29 @@ standalone-runnable for testing the viewer without Isaac Sim.
 - World state (room outline, static object footprints, robot pose) goes out over a `"worldmap"`
   data channel as JSON at 10 Hz (`_send_world_state`), rendered as a top-down view on a plain
   `<canvas>` (simpler than three.js for flat rectangles/labels).
+- Status goes out over a `"status"` data channel as JSON at 5 Hz (`_send_status`,
+  `FrameStore.update_status`/`get_status`) — deliberately generic (an arbitrary dict, this module
+  has no concept of what's in it). `collect_pickplace_demo.py` uses it for the recorder's
+  state/episode/frame-count; `stream_demo.py` never calls `update_status`, so the browser page's
+  recorder UI (`static/index.html`'s `#recorder-bar`, hidden by default) just never appears for it.
+- **The one path in the other direction**: a `"control"` data channel carries browser→server
+  messages (button clicks), relayed via `FrameStore.push_command`/`pop_commands` into whatever the
+  consuming script's main loop wants to do with them — again generic, this module doesn't
+  interpret command contents. `collect_pickplace_demo.py` maps `{"action": "toggle_record"}` /
+  `{"action": "label", "value": "success"|"fail"}` / `{"action": "discard"}` onto the exact same
+  flags its keyboard handler sets, so a browser button and a keypress are interchangeable inputs
+  into one state machine, not two parallel ones.
 
-**Data channels must be created client-side.** Per WebRTC/JSEP, an answer can't introduce an SCTP
-"application" section that wasn't in the offer, so the browser (`static/viewer.js`) calls
-`createDataChannel` for both channels before generating its offer, and the server only ever
-listens via `pc.on("datachannel")` — a server-side `createDataChannel()` call after receiving the
-offer cannot negotiate (confirmed live: `readyState` stuck at `"connecting"` forever). Same
-reasoning shapes the video side: both tracks land in one remote `MediaStream` on the client
-(server never assigns them to distinct streams), so `viewer.js` wraps each `ontrack` event's own
-track in a fresh `MediaStream` rather than using `event.streams[0]`, or both `<video>` elements
-end up showing the RGB feed.
+**Data channels must be created client-side, including the reverse-direction "control" one.**
+Per WebRTC/JSEP, an answer can't introduce an SCTP "application" section that wasn't in the
+offer, so the browser (`static/viewer.js`) calls `createDataChannel` for every channel — even
+`"control"`, which the browser sends on and the server only listens to — before generating its
+offer, and the server only ever listens via `pc.on("datachannel")` — a server-side
+`createDataChannel()` call after receiving the offer cannot negotiate (confirmed live:
+`readyState` stuck at `"connecting"` forever). Same reasoning shapes the video side: both tracks
+land in one remote `MediaStream` on the client (server never assigns them to distinct streams),
+so `viewer.js` wraps each `ontrack` event's own track in a fresh `MediaStream` rather than using
+`event.streams[0]`, or both `<video>` elements end up showing the RGB feed.
 
 **Robot control in `stream_demo.py`** is a per-frame position/velocity command loop keyed off
 `held_keys` (see the module docstring for the full key map). Two recurring patterns worth knowing
@@ -121,7 +134,12 @@ here too). It drops lidar/depth entirely (not needed for offline data collection
 `streaming_server.py`'s WebRTC RGB track — same server `stream_demo.py` uses — purely so you can
 watch the camera feed in a browser while teleoperating; this is unrelated to what actually gets
 recorded (`EpisodeRecorder` samples the same camera independently, at `--record-fps`, regardless
-of whether anyone's watching the live stream). It adds a pushcart (`build_pushcart`, ported from
+of whether anyone's watching the live stream). It also pushes recorder state through the
+`"status"` channel and reads browser button clicks back through `"control"` (see the streaming
+architecture section above) — both drive the *same* `record_requested`/`label_success_requested`/
+etc. flags the keyboard handler sets, so `B`/`Y`/`F`/`Backspace` and the browser's
+Start/Stop/Success/Fail/Discard buttons are interchangeable inputs into one state machine. It adds
+a pushcart (`build_pushcart`, ported from
 `capture_cube_rgbd.py`) placed **adjacent** to the
 table rather than across the room, so the task is pure fixed-base arm/gripper/torso manipulation
 — no driving during an episode, no base pose in the recorded state/action space (21 dims: both

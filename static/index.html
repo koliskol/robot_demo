@@ -8,6 +8,14 @@
   header { padding: 0.75rem 1rem; display: flex; align-items: center; gap: 1rem; }
   header button { padding: 0.4rem 1rem; }
   #status { font-size: 0.9rem; color: #9c9; }
+  /* Hidden until the first "status" data channel message arrives (see viewer.js) - stays hidden
+     for pages whose script never calls FrameStore.update_status (e.g. stream_demo.py). */
+  #recorder-bar { display: none; padding: 0 1rem 0.75rem; align-items: center; gap: 0.75rem; }
+  #recorder-badge { font-size: 0.9rem; padding: 0.2rem 0.6rem; border-radius: 0.3rem; background: #333; }
+  #recorder-badge.recording { background: #7a1f1f; color: #fff; }
+  #recorder-badge.awaiting-label { background: #7a5a1f; color: #fff; }
+  #recorder-bar button { padding: 0.3rem 0.8rem; }
+  #recorder-bar button:disabled { opacity: 0.4; }
   main { display: grid; grid-template-columns: 1fr 1fr; grid-template-rows: auto auto; gap: 0.5rem; padding: 0 0.5rem; }
   figure { margin: 0; }
   figcaption { font-size: 0.85rem; color: #aaa; padding-bottom: 0.25rem; }
@@ -22,6 +30,13 @@
   <button id="connect">Connect</button>
   <span id="status">disconnected</span>
 </header>
+<div id="recorder-bar">
+  <span id="recorder-badge">idle</span>
+  <button id="record-toggle">Start Recording</button>
+  <button id="label-success">Success (Y)</button>
+  <button id="label-fail">Fail (F)</button>
+  <button id="label-discard">Discard</button>
+</div>
 <main>
   <figure>
     <figcaption>RGB</figcaption>

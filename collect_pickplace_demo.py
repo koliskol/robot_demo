@@ -13,8 +13,9 @@ Optionally open http://<host>:<port>/ (default http://0.0.0.0:8080/, see --host/
 browser and click Connect to watch the robot's front camera live via WebRTC while teleoperating,
 same server as stream_demo.py (streaming_server.py) - just the RGB feed here, no depth/lidar/map
 (this task has no depth or lidar sensor; the depth/map panels in the browser page will just stay
-blank, harmlessly). Purely a convenience for watching the camera view without needing to line up
-Isaac Sim's own viewport on a second camera - has no effect on what's recorded.
+blank, harmlessly). The page also shows a recorder status badge and Start/Stop/Success/Fail/
+Discard buttons mirroring the B/Y/F/Backspace keys below - either the browser buttons or the
+keyboard work interchangeably, both drive the same recorder state machine.
 
 Controls (viewport window must have focus) - drive/jog controls are unchanged from
 stream_demo.py/../Robot_project/capture_cube_rgbd.py:
@@ -846,6 +847,17 @@ def main() -> None:
     record_accum = 0.0
 
     while simulation_app.is_running():
+        for cmd in frame_store.pop_commands():
+            cmd_action = cmd.get("action")
+            if cmd_action == "toggle_record":
+                record_requested = True
+            elif cmd_action == "label" and cmd.get("value") == "success":
+                label_success_requested = True
+            elif cmd_action == "label" and cmd.get("value") == "fail":
+                label_fail_requested = True
+            elif cmd_action == "discard":
+                discard_requested = True
+
         if reset_requested:
             reset_requested = False
             if recorder_state is not RecorderState.IDLE:
@@ -894,6 +906,14 @@ def main() -> None:
                 recorder.discard()
                 recorder_state = RecorderState.IDLE
                 print("Episode discarded.")
+
+        frame_store.update_status(
+            {
+                "state": recorder_state.name,
+                "episode_index": recorder.episode_index,
+                "num_frames": len(recorder.frames),
+            }
+        )
 
         command = compute_drive_command(held_keys, args.drive_speed, args.turn_speed)
         action = drive_controller.forward(command)
