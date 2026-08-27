@@ -84,13 +84,13 @@ Controls during recording:
 | `U`/`O` | swing both arms forward/back (the hug) |
 | `J`/`L` | raise/lower both hands |
 | `M`/`N` | close/open both grippers (optional) |
-| `SPACE` | toggle: start recording → stop and await a label |
+| `B` | toggle: start recording → stop and await a label |
 | `Y` | (after stop) label the episode **success** and save it |
 | `F` | (after stop) label the episode **failure** and save it |
 | `Backspace` | (after stop) discard the episode, don't save |
 | `R` | reset robot/cube/cart to spawn (also discards an in-progress episode) |
 
-Per episode: jog into position → `SPACE` (start) → perform the hug-carry → `SPACE` (stop) →
+Per episode: jog into position → `B` (start) → perform the hug-carry → `B` (stop) →
 `Y`/`F`/`Backspace` → `R` → repeat.
 
 Episodes land in `./raw_episodes/episode_0000/`, `episode_0001/`, ... regardless of session, each

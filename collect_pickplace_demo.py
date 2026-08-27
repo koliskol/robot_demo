@@ -23,10 +23,10 @@ stream_demo.py/../Robot_project/capture_cube_rgbd.py:
                 primary hold; fingers can add a little extra contact but aren't required)
     R           reset the robot/cube/cart to spawn pose (also discards any in-progress episode)
 
-    SPACE       toggle: start recording an episode / stop and await a label
-    Y           (after SPACE-stop) label the just-recorded episode a SUCCESS and save it
-    F           (after SPACE-stop) label the just-recorded episode a FAILURE and save it
-    BACKSPACE   (after SPACE-stop) discard the just-recorded episode without saving
+    B           toggle: start recording an episode / stop and await a label
+    Y           (after B-stop) label the just-recorded episode a SUCCESS and save it
+    F           (after B-stop) label the just-recorded episode a FAILURE and save it
+    BACKSPACE   (after B-stop) discard the just-recorded episode without saving
 
     Close the viewport window to exit.
 
@@ -193,10 +193,13 @@ CART_TABLE_GAP_M = 0.15
 SECOND_TABLE_POSITION = (8.0, -6.0)
 
 # Gap (meters, edge to edge) between adjacent boxes when --extra-boxes lays out 3 side by side on
-# the table. Not verified against the actual table asset's footprint (unknown until runtime) -
-# if a box ends up hanging off the table edge, either shrink this, shrink --cube2-size/
-# --cube3-size, or check the table asset's real width via the geometry diagnostic printout.
-CUBE_ROW_GAP_M = 0.05
+# the table - kept generous so the boxes are clearly separate pick-up targets, not crowded
+# together. Confirmed live against the actual table asset's footprint (0.8m x 2.8m, x by y): at
+# this gap, cube2/cube3 sit at y=+-0.875 with ~0.28m clearance to the table's y-edge (table's
+# y-half-extent is 1.4m) - still comfortably on the table. If box sizes are changed via
+# --cube2-scale/--cube3-scale, re-check via the startup geometry diagnostic printout rather than
+# assuming this still fits.
+CUBE_ROW_GAP_M = 0.4
 
 DRIVE_KEY_AXES = {
     carb.input.KeyboardInput.W: (0, 1.0),
@@ -258,7 +261,18 @@ TORSO_HEIGHT_KEYS = {
 }
 
 MAX_JOINT_LEAD_RAD = 0.3
-ARM_CONTACT_MAX_LEAD_RAD = 0.1
+# Tighter than stream_demo.py/capture_cube_rgbd.py's 0.1 rad - live-observed here (holding U
+# pressed into the bigger/heavier real box, arms flung the robot after a sustained hold, not on
+# first contact) that 0.1 rad of continuously-reasserted lead is enough sustained torque against
+# this task's larger contact area to destabilize the robot over time. Every physics step this
+# clamp recomputes the target as "actual position +/- max_lead", so as long as a swing key is
+# held into something that isn't yielding, the controller keeps trying to advance that lead
+# indefinitely - there's no per-frame magnitude that's safe forever, only "tight enough that the
+# sustained-contact steady-state force stays survivable." Same principle as GRIPPER_MAX_LEAD_RAD
+# below, just less extreme since the arm contact area/torque budget is larger than a fingertip
+# pinch. Not yet swept to find a real ceiling - lower further if a sustained hug still flings the
+# robot, same as this constant's sibling-project counterpart says for its own value.
+ARM_CONTACT_MAX_LEAD_RAD = 0.03
 
 
 def arm_swing_rate(side: str, arm_speed: float) -> float:
@@ -388,8 +402,17 @@ def make_box_dynamic(prim_path: str, mass: float) -> None:
     for (BOX_ASSET_MAIN/CUBE2/CUBE3) ship as static, collision-only meshes - confirmed live: the
     mesh's collision approximation defaults to "none" (an exact triangle mesh), which PhysX
     accepts for a static collider but rejects for a *dynamic* rigid body - only convex shapes are
-    valid there. convexHull is a safe choice for a box-shaped mesh (tested live: settles cleanly
-    under gravity from a 1m drop, no NaN/instability, <1mm of settling drift). `Apply()` is a
+    valid there. convexHull is a safe choice for a box-shaped mesh (tested live: a controlled
+    two-plate squeeze against it settled cleanly, no NaN/instability, and convexHull vs
+    boundingCube made no meaningful difference in that test - the shape choice itself does not
+    appear to be what destabilizes a *sustained* two-arm hug, see BOX_CONTACT_OFFSET_M's comment
+    below for the more likely cause).
+
+    Also authors the same PhysxCollisionAPI contact tuning `isaacsim.core.api.objects.DynamicCuboid`
+    gives every cuboid by default (rest_offset=0.0, contact_offset=0.1m, torsional_patch_radius=1.0,
+    min_torsional_patch_radius=0.8) - the earlier procedural-cube version of this scene got this
+    for free; these real mesh assets don't, and torsional patch radius specifically matters for a
+    friction-only hug (it's what resists the box twisting/slipping in the grip). `Apply()` is a
     no-op if an API is already present, so this is safe to call even on an asset that already had
     physics authored.
     """
@@ -400,6 +423,11 @@ def make_box_dynamic(prim_path: str, mass: float) -> None:
     if mesh_prim is not None:
         UsdPhysics.CollisionAPI.Apply(mesh_prim)
         UsdPhysics.MeshCollisionAPI.Apply(mesh_prim).CreateApproximationAttr("convexHull")
+        physx_collision = PhysxSchema.PhysxCollisionAPI.Apply(mesh_prim)
+        physx_collision.CreateRestOffsetAttr().Set(0.0)
+        physx_collision.CreateContactOffsetAttr().Set(0.1)
+        physx_collision.CreateTorsionalPatchRadiusAttr().Set(1.0)
+        physx_collision.CreateMinTorsionalPatchRadiusAttr().Set(0.8)
 
 
 def spawn_real_box(
@@ -752,18 +780,18 @@ def main() -> None:
 
     held_keys: set = set()
     reset_requested = False
-    space_requested = False
+    record_requested = False
     label_success_requested = False
     label_fail_requested = False
     discard_requested = False
 
     def on_keyboard_event(event, *_args, **_kwargs) -> bool:
-        nonlocal reset_requested, space_requested, label_success_requested, label_fail_requested, discard_requested
+        nonlocal reset_requested, record_requested, label_success_requested, label_fail_requested, discard_requested
         if event.type == carb.input.KeyboardEventType.KEY_PRESS:
             if event.input == carb.input.KeyboardInput.R:
                 reset_requested = True
-            elif event.input == carb.input.KeyboardInput.SPACE:
-                space_requested = True
+            elif event.input == carb.input.KeyboardInput.B:
+                record_requested = True
             elif event.input == carb.input.KeyboardInput.Y:
                 label_success_requested = True
             elif event.input == carb.input.KeyboardInput.F:
@@ -790,7 +818,7 @@ def main() -> None:
     print("  Hold U: both arms swing forward (shoulder only). Hold O: swing back to open.")
     print("  Hold J: both hands raise (elbow only). Hold L: both hands lower.")
     print("  Hold M: both grippers close. Hold N: both grippers open.")
-    print("  SPACE: start/stop episode recording. After stop: Y=success, F=failure, Backspace=discard.")
+    print("  B: start/stop episode recording. After stop: Y=success, F=failure, Backspace=discard.")
     print("  R resets (also discards an in-progress episode). Close the window to exit.")
 
     physics_dt = world.get_physics_dt()
@@ -814,8 +842,8 @@ def main() -> None:
             record_accum = 0.0
             continue
 
-        if space_requested:
-            space_requested = False
+        if record_requested:
+            record_requested = False
             if recorder_state is RecorderState.IDLE:
                 recorder.start()
                 recorder_state = RecorderState.RECORDING
