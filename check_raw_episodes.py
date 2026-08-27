@@ -12,6 +12,8 @@ Checks, per episode:
   - state and action aren't pinned at the same value every frame (a sign nothing actually moved,
     e.g. a key wasn't held long enough or the recorder started before any motion began).
   - RGB frames aren't blank/near-uniform (a sign the camera wasn't ready or nothing is in view).
+  - If the manifest says depth was captured: frames/*_depth.npy count matches, and a sample of
+    them contain no NaN (Inf is a legitimate "no-hit" depth reading, not flagged as a problem).
 
 Exits non-zero if any episode fails a check, after printing every problem found (not just the
 first) so you can fix a whole batch in one pass rather than one failure at a time.
@@ -70,6 +72,18 @@ def check_episode(episode_dir: Path) -> list:
         img = np.array(Image.open(frame_paths[i]).convert("RGB"))
         if img.std() < 1.0:
             problems.append(f"frame {i} ({frame_paths[i].name}) looks blank/near-uniform (std={img.std():.3f})")
+
+    if manifest.get("depth_capture", False):
+        depth_paths = sorted(frames_dir.glob("*_depth.npy")) if frames_dir.exists() else []
+        if len(depth_paths) != num_frames:
+            problems.append(f"found {len(depth_paths)} depth .npy files but manifest says {num_frames}")
+        for i in sample_indices:
+            if i < len(depth_paths):
+                depth = np.load(depth_paths[i])
+                # Inf is a legitimate "no-hit" reading (see EpisodeRecorder.save) - only NaN
+                # indicates an actual problem.
+                if np.isnan(depth).any():
+                    problems.append(f"depth frame {i} ({depth_paths[i].name}) contains NaN values")
 
     duration = num_frames / fps
     print(

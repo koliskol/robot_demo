@@ -21,6 +21,18 @@ run, in your lerobot env:
 (or the lerobot.common.datasets... path - this script tries both, see the import block below)
 and adjust build_features()/main() below to match whatever you actually see. Treat everything
 past the import block as a best-effort starting point, not a verified-working script.
+
+NOT YET WIRED IN: collect_pickplace_demo.py records depth too (raw float32 meters,
+frames/NNNNNN_depth.npy per frame, "just in case" a future policy wants it) but this converter
+currently only builds RGB + state/action features - depth isn't added to the dataset. LeRobot
+gained depth *dataset* support in v0.6.0 (RealSense-oriented, 12-bit depth video streams,
+`use_depth: true`), but that's storage infrastructure, not confirmed support in the standard
+policies (ACT/Diffusion/SmolVLA/etc. don't appear to consume depth as a model input out of the
+box as of this writing) - so adding it here would mean guessing at an API this project has no way
+to verify without a live lerobot install, for a policy that likely wouldn't use it anyway. If you
+want depth in the trained dataset: check the installed lerobot version's actual depth feature API
+first (same "don't trust this file" caveat as the RGB path above, doubly so here), then extend
+load_raw_episode/build_features/main to read the `*_depth.npy` files already sitting on disk.
 """
 
 import argparse

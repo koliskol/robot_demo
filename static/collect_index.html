@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Pick-and-Place Data Collection</title>
+<style>
+  body { margin: 0; background: #111; color: #eee; font-family: sans-serif; }
+  header { padding: 0.75rem 1rem; display: flex; align-items: center; gap: 1rem; }
+  header button { padding: 0.4rem 1rem; }
+  #status { font-size: 0.9rem; color: #9c9; }
+  #recorder-bar { padding: 0 1rem 0.75rem; display: flex; align-items: center; gap: 0.75rem; }
+  #recorder-badge { font-size: 0.9rem; padding: 0.2rem 0.6rem; border-radius: 0.3rem; background: #333; }
+  #recorder-badge.recording { background: #7a1f1f; color: #fff; }
+  #recorder-badge.awaiting-label { background: #7a5a1f; color: #fff; }
+  #recorder-bar button { padding: 0.3rem 0.8rem; }
+  #recorder-bar button:disabled { opacity: 0.4; }
+  main { padding: 0 1rem 1rem; display: flex; gap: 0.5rem; flex-wrap: wrap; }
+  figure { margin: 0; flex: 1 1 420px; }
+  figcaption { font-size: 0.85rem; color: #aaa; padding-bottom: 0.25rem; }
+  video { width: 100%; background: #000; display: block; }
+</style>
+</head>
+<body>
+<header>
+  <h1 style="font-size:1.1rem;margin:0;">Pick-and-Place Data Collection</h1>
+  <button id="connect">Connect</button>
+  <span id="status">disconnected</span>
+</header>
+<div id="recorder-bar">
+  <span id="recorder-badge">idle</span>
+  <button id="record-toggle">Start Recording</button>
+  <button id="label-success">Success (Y)</button>
+  <button id="label-fail">Fail (F)</button>
+  <button id="label-discard">Discard</button>
+</div>
+<main>
+  <figure>
+    <figcaption>RGB</figcaption>
+    <video id="rgb" autoplay playsinline muted></video>
+  </figure>
+  <figure>
+    <figcaption>Depth (normalized preview)</figcaption>
+    <video id="depth" autoplay playsinline muted></video>
+  </figure>
+</main>
+<script type="module" src="viewer.js"></script>
+</body>
+</html>

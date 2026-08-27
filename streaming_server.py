@@ -227,14 +227,24 @@ async def _send_status(channel, frame_store: FrameStore, hz: float = 5.0) -> Non
         await asyncio.sleep(interval)
 
 
-def build_app(frame_store: FrameStore) -> web.Application:
+def build_app(frame_store: FrameStore, static_index: str = "index.html", static_viewer_js: str = "viewer.js") -> web.Application:
+    """`static_index`/`static_viewer_js` let a consuming script serve its own tailored page
+    (e.g. collect_pickplace_demo.py's static/collect_index.html + collect_viewer.js, which skips
+    the map/point-cloud panels this module's default page has - that script has no lidar/map
+    data to send, though it does show both RGB and depth) without touching stream_demo.py's own
+    static/index.html + viewer.js. Video track negotiation below is unconditional either way
+    (always both RGB and depth tracks, regardless of which page connects) - a page could choose
+    not to render one without any server change (just don't bind it to a <video> element), but
+    changing how many tracks get negotiated per page would need the client to declare a matching
+    number of transceivers in its offer, which is more JSEP-negotiation risk than it's worth.
+    """
     pcs: set[RTCPeerConnection] = set()
 
     async def index(request: web.Request) -> web.Response:
-        return web.FileResponse(STATIC_DIR / "index.html")
+        return web.FileResponse(STATIC_DIR / static_index)
 
     async def viewer_js(request: web.Request) -> web.Response:
-        return web.FileResponse(STATIC_DIR / "viewer.js")
+        return web.FileResponse(STATIC_DIR / static_viewer_js)
 
     async def offer(request: web.Request) -> web.Response:
         params = await request.json()
@@ -300,11 +310,18 @@ def build_app(frame_store: FrameStore) -> web.Application:
     return app
 
 
-def run_in_background(frame_store: FrameStore, host: str = "0.0.0.0", port: int = 8080) -> threading.Thread:
+def run_in_background(
+    frame_store: FrameStore,
+    host: str = "0.0.0.0",
+    port: int = 8080,
+    static_index: str = "index.html",
+    static_viewer_js: str = "viewer.js",
+) -> threading.Thread:
     """Start the WebRTC signaling/media server in a daemon background thread with its own
     asyncio event loop, and return immediately - the caller's own (Isaac Sim) loop keeps
     running on the main thread untouched. Daemon thread: exits automatically when the main
-    process does, no explicit shutdown call needed from the sim side.
+    process does, no explicit shutdown call needed from the sim side. See build_app for what
+    static_index/static_viewer_js are for.
     """
 
     def _run() -> None:
@@ -312,7 +329,7 @@ def run_in_background(frame_store: FrameStore, host: str = "0.0.0.0", port: int 
         asyncio.set_event_loop(loop)
 
         async def _serve() -> None:
-            app = build_app(frame_store)
+            app = build_app(frame_store, static_index=static_index, static_viewer_js=static_viewer_js)
             runner = web.AppRunner(app)
             await runner.setup()
             site = web.TCPSite(runner, host, port)

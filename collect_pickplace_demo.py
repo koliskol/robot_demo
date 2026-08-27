@@ -10,12 +10,12 @@ Usage:
     conda run -n isaac_sim python collect_pickplace_demo.py --out ./raw_episodes --deck-riser 0.5
 
 Optionally open http://<host>:<port>/ (default http://0.0.0.0:8080/, see --host/--port) in a
-browser and click Connect to watch the robot's front camera live via WebRTC while teleoperating,
-same server as stream_demo.py (streaming_server.py) - just the RGB feed here, no depth/lidar/map
-(this task has no depth or lidar sensor; the depth/map panels in the browser page will just stay
-blank, harmlessly). The page also shows a recorder status badge and Start/Stop/Success/Fail/
-Discard buttons mirroring the B/Y/F/Backspace keys below - either the browser buttons or the
-keyboard work interchangeably, both drive the same recorder state machine.
+browser and click Connect to watch the robot's front camera (RGB + false-colored depth preview)
+live via WebRTC while teleoperating, same server as stream_demo.py (streaming_server.py) but its
+own dedicated page (no map/point-cloud - this task has no lidar/world-state data). The page also
+shows a recorder status badge and Start/Stop/Success/Fail/Discard buttons mirroring the
+B/Y/F/Backspace keys below - either the browser buttons or the keyboard work interchangeably,
+both drive the same recorder state machine.
 
 Controls (viewport window must have focus) - drive/jog controls are unchanged from
 stream_demo.py/../Robot_project/capture_cube_rgbd.py:
@@ -59,13 +59,16 @@ stable and both arms can actually converge around the box from a single parked p
 PUSHCART_DECK_HALF_EXTENT / --deck-riser / ROBOT_APPROACH_GAP_M below for the other knobs to turn
 if the geometry doesn't work on the first try.
 
-Camera/lidar mounting and the arm/hand/torso jog constants mirror stream_demo.py and
+Camera mounting and the arm/hand/torso jog constants mirror stream_demo.py and
 ../Robot_project/capture_cube_rgbd.py exactly (same Galbot G1 asset, same joint targets/clamps/
-rates) - see stream_demo.py's module docstring for the full derivation. This script drops
-lidar/depth entirely (not needed for offline data collection, only RGB is recorded) and adds a
-pushcart + graspable boxes, ported/adapted from capture_cube_rgbd.py's build_pushcart and cube
-spawn (see those functions below for what changed and why). It reuses streaming_server.py's RGB
-video track (same as stream_demo.py) purely for live viewing convenience - streamed frames are
+rates) - see stream_demo.py's module docstring for the full derivation; the mount itself is NOT
+identical, see CAMERA_MOUNT_TRANSLATION_M's comment for why. This script drops lidar entirely
+(not needed for offline data collection) but does capture depth (RGB + depth are both recorded,
+"just in case" a future policy wants it - see EpisodeRecorder.save; nothing in convert_to_lerobot.py
+uses it yet, that's a deliberately-unimplemented next step, see that script's own comment) and
+adds a pushcart + graspable boxes, ported/adapted from capture_cube_rgbd.py's build_pushcart and
+cube spawn (see those functions below for what changed and why). It reuses streaming_server.py's
+video tracks (same as stream_demo.py) purely for live viewing convenience - streamed frames are
 NOT what gets recorded to disk; recording samples at a fixed rate via EpisodeRecorder below,
 independent of the WebRTC feed.
 """
@@ -171,6 +174,29 @@ from streaming_server import FrameStore, run_in_background
 TABLE_ASSET = "/Isaac/Environments/Office/Props/SM_TableB.usd"
 ROBOT_ASSET = "/Isaac/Robots/Galbot/galbot_g1/galbot_g1.usda"
 ROBOT_PRIM = "/World/Robot"
+
+# Camera mount - pulled back, raised, and tilted down from stream_demo.py's flat/level 0.4/0.9/
+# identity mount (that mount is fine for the streaming demo's driving-around use case, but wrong
+# for this one). Confirmed live by rendering frames at several mounts/tilts: at the level mount,
+# a box on the table was completely out of frame at the robot's normal ~0.9m approach distance -
+# the table's own edge geometry blocks line of sight to anything on top of it at a grazing near-
+# horizontal angle, and no amount of horizontal-only positioning fixes that, only tilting down
+# does. Table-side view confirmed clear at this mount; the pushcart isn't reliably framed by it,
+# but that's an existing, separate, already-documented issue (the robot's parked position is
+# centered in y *between* the table and cart, not aligned with either - see
+# ROBOT_APPROACH_GAP_M's comment) rather than something this mount change causes.
+CAMERA_MOUNT_TRANSLATION_M = (0.3, 0.0, 1.5)
+CAMERA_TILT_DEG = 45.0
+
+
+def camera_tilt_quat(tilt_deg: float) -> np.ndarray:
+    """Downward-pitch quaternion for Camera.set_local_pose's default "world" axes convention
+    (+Z up, +X forward, per that method's own docstring) - a positive rotation about Y tilts the
+    look direction from +X toward -Z (down). Verified live: rendered frames at several angles and
+    visually confirmed the table/box moved into frame as this angle increases.
+    """
+    half = np.radians(tilt_deg) / 2.0
+    return np.array([np.cos(half), 0.0, np.sin(half), 0.0])
 
 # Real cardboard-box props from Isaac's warehouse/logistics environment set (plain generic
 # shipping boxes, not branded grocery items) - see spawn_real_box/make_box_dynamic below for why
@@ -568,8 +594,10 @@ class RecorderState(Enum):
 
 
 class EpisodeRecorder:
-    """Buffers one episode's RGB frames + proprioception/action vectors in memory (a few
-    seconds at 15Hz/640x480 is a few hundred MB at most - fine to hold in RAM) and writes it to
+    """Buffers one episode's RGB + depth frames and proprioception/action vectors in memory (a
+    few seconds at 15Hz/640x480 is comfortably under a GB - depth is the big one, raw float32 at
+    ~1.2MB/frame vs RGB's tens-of-KB compressed PNG - fine to hold in RAM for one episode, but
+    worth knowing before recording a long session: this adds up on disk fast) and writes it to
     disk as raw_episodes/episode_NNNN/ on save(). Deliberately not LeRobot-shaped directly (no
     lerobot import here) - see convert_to_lerobot.py for the offline conversion step, run in a
     separate environment.
@@ -594,14 +622,16 @@ class EpisodeRecorder:
 
     def _reset_buffer(self) -> None:
         self.frames: list = []
+        self.depth_frames: list = []
         self.states: list = []
         self.actions: list = []
 
     def start(self) -> None:
         self._reset_buffer()
 
-    def append(self, rgb: np.ndarray, state: np.ndarray, action: np.ndarray) -> None:
+    def append(self, rgb: np.ndarray, depth: np.ndarray, state: np.ndarray, action: np.ndarray) -> None:
         self.frames.append(np.ascontiguousarray(rgb[:, :, :3]))
+        self.depth_frames.append(np.ascontiguousarray(depth, dtype=np.float32))
         self.states.append(state)
         self.actions.append(action)
 
@@ -617,6 +647,13 @@ class EpisodeRecorder:
         frames_dir.mkdir(parents=True, exist_ok=True)
         for i, rgb in enumerate(self.frames):
             Image.fromarray(rgb, mode="RGB").save(frames_dir / f"{i:06d}_rgb.png")
+        for i, depth in enumerate(self.depth_frames):
+            # Raw float32 meters, not a lossy colorized preview - matches capture_cube_rgbd.py's
+            # save_depth precedent (np.save of the raw array) rather than streaming_server.py's
+            # _depth_to_rgb (that's a viewer-only preview, not something to train on). May contain
+            # inf for no-hit pixels - that's a legitimate reading, not an error; left as-is for
+            # whatever consumes this later to handle (see check_raw_episodes.py's NaN-only check).
+            np.save(frames_dir / f"{i:06d}_depth.npy", depth)
 
         state_arr = np.stack(self.states).astype(np.float32)
         action_arr = np.stack(self.actions).astype(np.float32)
@@ -635,6 +672,7 @@ class EpisodeRecorder:
             "action_dim": action_arr.shape[1],
             "state_names": self.state_names,
             "camera": {"key": self.camera_key, "width": self.image_hw[1], "height": self.image_hw[0]},
+            "depth_capture": True,
             "num_frames": len(self.frames),
         }
         (ep_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
@@ -656,6 +694,14 @@ def main() -> None:
     stage = get_current_stage()
 
     build_room(stage)
+
+    # Lighting - missing entirely until now (build_room only builds walls, no lights), which is
+    # why the scene was dark. Matches stream_demo.py's build_scene exactly.
+    dome_light = UsdLux.DomeLight.Define(stage, "/World/DomeLight")
+    dome_light.CreateIntensityAttr(1000.0)
+    distant_light = UsdLux.DistantLight.Define(stage, "/World/SunLight")
+    distant_light.CreateIntensityAttr(3000.0)
+
     bbox_cache = bounds_utils.create_bbox_cache()
 
     add_reference_to_stage(usd_path=assets_root_path + TABLE_ASSET, prim_path="/World/Table")
@@ -739,10 +785,11 @@ def main() -> None:
     world.reset()
     robot.initialize()
     camera.initialize()
+    camera.add_distance_to_image_plane_to_frame()
 
     aperture = camera.get_horizontal_aperture()
     camera.set_focal_length(float(aperture / (2.0 * np.tan(np.radians(60.0) / 2.0))))
-    camera.set_local_pose(translation=np.array([0.4, 0.0, 0.9]), orientation=np.array([1.0, 0.0, 0.0, 0.0]))
+    camera.set_local_pose(translation=np.array(CAMERA_MOUNT_TRANSLATION_M), orientation=camera_tilt_quat(CAMERA_TILT_DEG))
 
     for _ in range(60):
         world.step(render=True)
@@ -797,7 +844,9 @@ def main() -> None:
     # fixed rate below. No depth/lidar here, so the browser page's depth/map/point-cloud panels
     # just stay blank; harmless.
     frame_store = FrameStore()
-    run_in_background(frame_store, host=args.host, port=args.port)
+    run_in_background(
+        frame_store, host=args.host, port=args.port, static_index="collect_index.html", static_viewer_js="collect_viewer.js"
+    )
 
     held_keys: set = set()
     reset_requested = False
@@ -968,16 +1017,19 @@ def main() -> None:
         rgba = camera.get_rgba()
         if rgba is not None:
             frame_store.update_rgb(rgba)
+        depth = camera.get_depth()
+        if depth is not None:
+            frame_store.update_depth(depth)
 
         record_accum += physics_dt
         if recorder_state is RecorderState.RECORDING and record_accum >= record_period:
             record_accum -= record_period
-            if rgba is not None:
+            if rgba is not None and depth is not None:
                 state_vec = robot.get_joint_positions()[state_dof_indices].astype(np.float32)
                 action_vec = np.concatenate([left_arm_q, right_arm_q, torso_q, left_gripper_q, right_gripper_q]).astype(
                     np.float32
                 )
-                recorder.append(rgba, state_vec, action_vec)
+                recorder.append(rgba, depth, state_vec, action_vec)
 
     simulation_app.close()
 

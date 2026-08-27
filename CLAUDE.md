@@ -66,39 +66,53 @@ camera, not a buffered stream. A slow client just sees fewer/staler frames, neve
 backlog. `streaming_server.py` has no `import isaacsim` anywhere, which is what makes it
 standalone-runnable for testing the viewer without Isaac Sim.
 
-**Six data paths to the browser, each shaped differently:**
-- RGB and depth are separate WebRTC video tracks (`RGBTrack`, `DepthTrack`). Depth is
-  false-colored (`_depth_to_rgb`: blue near → green mid → grey far, fixed 0–20m scale so a color
-  always means the same distance across frames) — exact float depth is never sent anywhere.
-- Point cloud goes out over a `"pointcloud"` WebRTC data channel as raw `float32` xyz bytes,
-  paced at 5 Hz by the server (`_send_point_cloud`), decoded client-side straight into a
-  `Float32Array` for a three.js `Points` cloud.
-- World state (room outline, static object footprints, robot pose) goes out over a `"worldmap"`
-  data channel as JSON at 10 Hz (`_send_world_state`), rendered as a top-down view on a plain
-  `<canvas>` (simpler than three.js for flat rectangles/labels).
-- Status goes out over a `"status"` data channel as JSON at 5 Hz (`_send_status`,
-  `FrameStore.update_status`/`get_status`) — deliberately generic (an arbitrary dict, this module
-  has no concept of what's in it). `collect_pickplace_demo.py` uses it for the recorder's
-  state/episode/frame-count; `stream_demo.py` never calls `update_status`, so the browser page's
-  recorder UI (`static/index.html`'s `#recorder-bar`, hidden by default) just never appears for it.
-- **The one path in the other direction**: a `"control"` data channel carries browser→server
-  messages (button clicks), relayed via `FrameStore.push_command`/`pop_commands` into whatever the
-  consuming script's main loop wants to do with them — again generic, this module doesn't
-  interpret command contents. `collect_pickplace_demo.py` maps `{"action": "toggle_record"}` /
-  `{"action": "label", "value": "success"|"fail"}` / `{"action": "discard"}` onto the exact same
-  flags its keyboard handler sets, so a browser button and a keypress are interchangeable inputs
-  into one state machine, not two parallel ones.
+**`build_app`/`run_in_background` serve a different static page per consuming script**, via
+`static_index`/`static_viewer_js` params (default `"index.html"`/`"viewer.js"`, so `stream_demo.py`'s
+own call site is unchanged). `stream_demo.py` gets the original page (RGB, depth, point cloud, top-
+down map); `collect_pickplace_demo.py` gets its own `static/collect_index.html` +
+`static/collect_viewer.js` (RGB + recorder controls only — no map/point-cloud/three.js, since that
+task has no lidar or world-state data). The URL path is always `/` and `/viewer.js` either way —
+only which file on disk answers those routes changes. Video track negotiation itself is
+unconditional regardless of which page connects (`offer()` always calls `pc.addTrack(RGBTrack(...))`
+then `pc.addTrack(DepthTrack(...))`), so `collect_viewer.js` still declares two recvonly
+transceivers even though it only renders the first track — skipping a *render* is free; skipping a
+*transceiver* would mean the server's second `addTrack()` has no matching offer m-section, hitting
+the same JSEP violation the data-channel comment below describes.
+
+**Six data paths total, split across the two pages, each shaped differently:**
+- RGB and depth are separate WebRTC video tracks (`RGBTrack`, `DepthTrack`), on both pages. Depth
+  is false-colored (`_depth_to_rgb`: blue near → green mid → grey far, fixed 0–20m scale so a
+  color always means the same distance across frames) — exact float depth is never sent anywhere.
+- Point cloud (`stream_demo.py`'s page only) goes out over a `"pointcloud"` WebRTC data channel as
+  raw `float32` xyz bytes, paced at 5 Hz by the server (`_send_point_cloud`), decoded client-side
+  straight into a `Float32Array` for a three.js `Points` cloud.
+- World state (`stream_demo.py`'s page only: room outline, static object footprints, robot pose)
+  goes out over a `"worldmap"` data channel as JSON at 10 Hz (`_send_world_state`), rendered as a
+  top-down view on a plain `<canvas>`.
+- Status (`collect_pickplace_demo.py`'s page only) goes out over a `"status"` data channel as
+  JSON at 5 Hz (`_send_status`, `FrameStore.update_status`/`get_status`) — deliberately generic
+  (an arbitrary dict; this module has no concept of what's in it). `collect_pickplace_demo.py`
+  uses it for the recorder's state/episode/frame-count.
+- **The one path in the other direction, also `collect_pickplace_demo.py`-only**: a `"control"`
+  data channel carries browser→server messages (button clicks), relayed via
+  `FrameStore.push_command`/`pop_commands` into whatever the consuming script's main loop wants to
+  do with them — again generic, this module doesn't interpret command contents.
+  `collect_pickplace_demo.py` maps `{"action": "toggle_record"}` / `{"action": "label", "value":
+  "success"|"fail"}` / `{"action": "discard"}` onto the exact same flags its keyboard handler
+  sets, so a browser button and a keypress are interchangeable inputs into one state machine, not
+  two parallel ones.
 
 **Data channels must be created client-side, including the reverse-direction "control" one.**
 Per WebRTC/JSEP, an answer can't introduce an SCTP "application" section that wasn't in the
-offer, so the browser (`static/viewer.js`) calls `createDataChannel` for every channel — even
-`"control"`, which the browser sends on and the server only listens to — before generating its
-offer, and the server only ever listens via `pc.on("datachannel")` — a server-side
-`createDataChannel()` call after receiving the offer cannot negotiate (confirmed live:
-`readyState` stuck at `"connecting"` forever). Same reasoning shapes the video side: both tracks
-land in one remote `MediaStream` on the client (server never assigns them to distinct streams),
-so `viewer.js` wraps each `ontrack` event's own track in a fresh `MediaStream` rather than using
-`event.streams[0]`, or both `<video>` elements end up showing the RGB feed.
+offer, so the browser (`static/viewer.js` / `static/collect_viewer.js`) calls `createDataChannel`
+for every channel it needs — even `"control"`, which the browser sends on and the server only
+listens to — before generating its offer, and the server only ever listens via
+`pc.on("datachannel")` — a server-side `createDataChannel()` call after receiving the offer
+cannot negotiate (confirmed live: `readyState` stuck at `"connecting"` forever). Same reasoning
+shapes the video side: both tracks land in one remote `MediaStream` on the client (server never
+assigns them to distinct streams), so `viewer.js` wraps each `ontrack` event's own track in a
+fresh `MediaStream` rather than using `event.streams[0]`, or both `<video>` elements end up
+showing the RGB feed.
 
 **Robot control in `stream_demo.py`** is a per-frame position/velocity command loop keyed off
 `held_keys` (see the module docstring for the full key map). Two recurring patterns worth knowing
@@ -130,14 +144,19 @@ deliberate config choice, not incidental.
 
 `collect_pickplace_demo.py` is a third sibling to `stream_demo.py`/`capture_cube_rgbd.py`, built
 the same way (copied and adapted, not imported — see the mirroring note above, which applies
-here too). It drops lidar/depth entirely (not needed for offline data collection) but does reuse
-`streaming_server.py`'s WebRTC RGB track — same server `stream_demo.py` uses — purely so you can
-watch the camera feed in a browser while teleoperating; this is unrelated to what actually gets
-recorded (`EpisodeRecorder` samples the same camera independently, at `--record-fps`, regardless
-of whether anyone's watching the live stream). It also pushes recorder state through the
-`"status"` channel and reads browser button clicks back through `"control"` (see the streaming
-architecture section above) — both drive the *same* `record_requested`/`label_success_requested`/
-etc. flags the keyboard handler sets, so `B`/`Y`/`F`/`Backspace` and the browser's
+here too). It drops lidar entirely (not needed for offline data collection) but captures and
+records both RGB and depth (raw float32 meters per frame, `frames/NNNNNN_depth.npy`, "just in
+case" a future policy wants it — `convert_to_lerobot.py` doesn't use it yet, see that script's own
+docstring for why) and reuses `streaming_server.py`'s WebRTC server — same module `stream_demo.py`
+uses — but with its own dedicated page (`static/collect_index.html`/`collect_viewer.js`, RGB +
+depth + recorder controls, no map/point-cloud) rather than the shared one, so nothing here touches
+`stream_demo.py`'s page. This is unrelated to what actually gets recorded (`EpisodeRecorder`
+samples the same camera independently, at `--record-fps`, regardless of whether anyone's watching
+the live stream). It
+also pushes recorder state through the `"status"` channel and reads browser button clicks back
+through `"control"` (see the streaming architecture section above) — both drive the *same*
+`record_requested`/`label_success_requested`/etc. flags the keyboard handler sets, so
+`B`/`Y`/`F`/`Backspace` and the browser's
 Start/Stop/Success/Fail/Discard buttons are interchangeable inputs into one state machine. It adds
 a pushcart (`build_pushcart`, ported from
 `capture_cube_rgbd.py`) placed **adjacent** to the
@@ -199,6 +218,22 @@ table height. `pushcart_deck_top_z()`/`--deck-riser` raise the deck without touc
 already-stability-tuned caster joints — tune this empirically per the module docstring rather than
 assuming a value. Likewise `ROBOT_APPROACH_GAP_M`/`CART_TABLE_GAP_M` (parking distance and
 cart-table clearance) are first guesses, not verified reach envelopes.
+
+**Lighting is authored explicitly in `main()`** (a `DomeLight` + `DistantLight`, matching
+`stream_demo.py`'s `build_scene`) — `build_room` only builds walls, it was never responsible for
+lighting, and an earlier version of this script omitted lights entirely (scene was too dark to
+see anything). If a future refactor moves scene-building around, keep the light authoring
+somewhere that always runs.
+
+**The camera mount is tilted down and raised (`CAMERA_MOUNT_TRANSLATION_M`/`CAMERA_TILT_DEG`),
+unlike `stream_demo.py`'s flat/level mount.** An earlier version of this script reused
+`stream_demo.py`'s exact mount (0.4/0.9m, no tilt) and the box was completely out of frame at the
+robot's normal table approach distance — confirmed live by rendering frames at several
+mounts/tilts: the table's own edge geometry blocks line of sight to anything sitting on top of it
+at a grazing near-horizontal angle, and no amount of horizontal repositioning fixes that, only
+tilting down does. `camera_tilt_quat()` documents the rotation-axis convention this depends on.
+Confirmed clear for the table view; not reliably framing the pushcart, but that's the existing
+robot/cart y-alignment issue above, not something this mount causes.
 
 **Recording is decoupled from LeRobot on purpose.** `collect_pickplace_demo.py` writes raw
 per-episode data (`manifest.json` + `data.npz` + `frames/*.png`) with zero `lerobot` dependency,

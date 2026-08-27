@@ -22,8 +22,9 @@ a tunable, why conversion runs in a separate environment). This document is the 
 ## Watching the robot's camera feed while collecting
 
 `collect_pickplace_demo.py` starts the same WebRTC server `stream_demo.py` uses
-(`streaming_server.py`), streaming just the RGB feed (no depth/lidar/map — this task doesn't use
-those sensors, so those panels on the browser page just stay blank). Open
+(`streaming_server.py`), but serves its own dedicated page — just the RGB feed, no depth/lidar/map
+panels at all (this task doesn't use those sensors, and unlike `stream_demo.py`'s page, they're
+not just hidden here, they don't exist on the page). Open
 `http://<this machine's address>:8080/` (or whatever `--host`/`--port` you passed) and click
 Connect to watch live while teleoperating.
 
@@ -114,10 +115,17 @@ containing:
 
 ```
 episode_0000/
-  manifest.json     # success flag, fps, task name, joint names, frame count
-  data.npz          # observation.state (T,21) and action (T,21) float32 arrays
-  frames/*.png       # RGB frames, one per recorded timestep
+  manifest.json           # success flag, fps, task name, joint names, frame count
+  data.npz                # observation.state (T,21) and action (T,21) float32 arrays
+  frames/NNNNNN_rgb.png   # RGB frame, one per recorded timestep
+  frames/NNNNNN_depth.npy # raw depth (meters, float32, 480x640) for the same timestep -
+                          # captured "just in case" a future policy wants it; not currently used
+                          # by convert_to_lerobot.py (see that script's own docstring)
 ```
+
+Depth also shows live in the browser viewer (a false-colored preview, same as `stream_demo.py`'s)
+alongside RGB, purely for your own viewing convenience — the recorded depth is the raw float
+array, not this colorized preview.
 
 Then record the reverse direction in a second session:
 
