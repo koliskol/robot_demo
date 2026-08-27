@@ -225,15 +225,32 @@ lighting, and an earlier version of this script omitted lights entirely (scene w
 see anything). If a future refactor moves scene-building around, keep the light authoring
 somewhere that always runs.
 
-**The camera mount is tilted down and raised (`CAMERA_MOUNT_TRANSLATION_M`/`CAMERA_TILT_DEG`),
-unlike `stream_demo.py`'s flat/level mount.** An earlier version of this script reused
-`stream_demo.py`'s exact mount (0.4/0.9m, no tilt) and the box was completely out of frame at the
-robot's normal table approach distance — confirmed live by rendering frames at several
-mounts/tilts: the table's own edge geometry blocks line of sight to anything sitting on top of it
-at a grazing near-horizontal angle, and no amount of horizontal repositioning fixes that, only
-tilting down does. `camera_tilt_quat()` documents the rotation-axis convention this depends on.
-Confirmed clear for the table view; not reliably framing the pushcart, but that's the existing
-robot/cart y-alignment issue above, not something this mount causes.
+**The camera is head-mounted (`HEAD_CAMERA_MOUNT`), not chassis-mounted like `stream_demo.py`'s
+`front_camera`.** This asset has a real 2-DOF head (`Head_Golf`) with its own purpose-built
+sensor mount point (`head_end_effector_mount_link`), found by walking the robot's full prim tree
+live, not guessed — nothing drives the head joints, so it sits at rest, but a head-mounted camera
+still moves with torso crouch (`I`/`K`), unlike a fixed chassis mount. Two earlier iterations got
+this wrong before landing here, both confirmed live rather than assumed: (1) a chassis-mounted,
+flat/level mount (`stream_demo.py`'s exact mount) put the box completely out of frame at the
+robot's normal table approach distance, because the table's own edge geometry blocks line of
+sight to anything on top of it at a grazing near-horizontal angle — fixed by tilting down, not by
+repositioning; (2) the head mount's own local frame doesn't face the robot's forward direction at
+all (confirmed by rendering at identity orientation — showed a sideways, rolled view) and needs a
+90° roll correction (`CAMERA_ROLL_DEG`) before any additional downward pitch makes sense; that
+correction is composed via `quat_multiply`/`camera_head_mount_quat`, verified against
+`scipy.spatial.transform.Rotation`'s composition before trusting it. The needed downward pitch
+(`CAMERA_TILT_DEG`) is much smaller here (10°) than the old chassis mount needed (45°), because
+the head sits much higher and further forward, so the look-down angle to a table-height box is
+shallow — confirmed by computing the actual head-to-box world vector live, not guessed by feel.
+FOV widened to `CAMERA_FOV_DEG` (90°) to help keep a nearby box in frame. Confirmed clear for the
+box-on-table view at the robot's normal ~0.9m parked distance; **does not** reliably keep a box in
+frame once it's held very close during the hug itself — a fixed camera angle geometrically cannot
+frame a target whose angular position swings this much as it's brought close. Not solved here;
+test live once the arms can be driven through an actual hug motion, since a synthetic "teleport a
+box to a guessed hold position" test turned out unreliable (the box position depends on
+uncontrolled joint settling, which isn't deterministic run to run). Pushcart framing is still not
+reliable either, but that's the existing robot/cart y-alignment issue above, not something this
+mount causes.
 
 **Recording is decoupled from LeRobot on purpose.** `collect_pickplace_demo.py` writes raw
 per-episode data (`manifest.json` + `data.npz` + `frames/*.png`) with zero `lerobot` dependency,

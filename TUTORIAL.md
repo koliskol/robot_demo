@@ -69,6 +69,7 @@ Things to check, and what to do if they fail:
 | The two arms don't converge enough around the box to hold it | This needs adjusting `ARM_FORWARD_POSE`'s shoulder angle in the script — a code change, not a CLI flag. Note how far off it is and we can tune it. |
 | Robot body collides with table/cart, or can't reach at all | Adjust `ROBOT_APPROACH_GAP_M`/`CART_TABLE_GAP_M` constants near the top of the script. |
 | Hold is unstable / box flies out of the hug | Lower `--cube-mass`, or bind a custom high-friction `PhysicsMaterial` onto the box (not done by default - see `spawn_real_box`'s docstring), before trying anything more exotic. Do **not** add a joint-based attach — see `CLAUDE.md`. |
+| Box goes out of frame once held close during the hug | Expected/known limitation, not yet solved - the camera is head-mounted (`HEAD_CAMERA_MOUNT`) with a fixed 10° downward tilt tuned for the box-on-table view, and no fixed camera angle can perfectly frame a target whose angular position swings this much as it's brought right up close. Confirm this specifically once you're driving the arms live - see `CLAUDE.md`'s camera-mount note for what's been tried. |
 
 The boxes are real cardboard-box props from Isaac's warehouse/logistics asset set (generic
 shipping boxes, not branded items) — plain colored cubes were dropped entirely. These ship as

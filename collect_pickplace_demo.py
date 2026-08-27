@@ -59,10 +59,11 @@ stable and both arms can actually converge around the box from a single parked p
 PUSHCART_DECK_HALF_EXTENT / --deck-riser / ROBOT_APPROACH_GAP_M below for the other knobs to turn
 if the geometry doesn't work on the first try.
 
-Camera mounting and the arm/hand/torso jog constants mirror stream_demo.py and
-../Robot_project/capture_cube_rgbd.py exactly (same Galbot G1 asset, same joint targets/clamps/
-rates) - see stream_demo.py's module docstring for the full derivation; the mount itself is NOT
-identical, see CAMERA_MOUNT_TRANSLATION_M's comment for why. This script drops lidar entirely
+The arm/hand/torso jog constants mirror stream_demo.py and ../Robot_project/capture_cube_rgbd.py
+exactly (same Galbot G1 asset, same joint targets/clamps/rates) - see stream_demo.py's module
+docstring for the full derivation. The camera mount is NOT the same as either sibling script's -
+this one is head-mounted, not chassis-mounted, see HEAD_CAMERA_MOUNT's comment for why. This
+script drops lidar entirely
 (not needed for offline data collection) but does capture depth (RGB + depth are both recorded,
 "just in case" a future policy wants it - see EpisodeRecorder.save; nothing in convert_to_lerobot.py
 uses it yet, that's a deliberately-unimplemented next step, see that script's own comment) and
@@ -175,28 +176,65 @@ TABLE_ASSET = "/Isaac/Environments/Office/Props/SM_TableB.usd"
 ROBOT_ASSET = "/Isaac/Robots/Galbot/galbot_g1/galbot_g1.usda"
 ROBOT_PRIM = "/World/Robot"
 
-# Camera mount - pulled back, raised, and tilted down from stream_demo.py's flat/level 0.4/0.9/
-# identity mount (that mount is fine for the streaming demo's driving-around use case, but wrong
-# for this one). Confirmed live by rendering frames at several mounts/tilts: at the level mount,
-# a box on the table was completely out of frame at the robot's normal ~0.9m approach distance -
-# the table's own edge geometry blocks line of sight to anything on top of it at a grazing near-
-# horizontal angle, and no amount of horizontal-only positioning fixes that, only tilting down
-# does. Table-side view confirmed clear at this mount; the pushcart isn't reliably framed by it,
-# but that's an existing, separate, already-documented issue (the robot's parked position is
-# centered in y *between* the table and cart, not aligned with either - see
-# ROBOT_APPROACH_GAP_M's comment) rather than something this mount change causes.
-CAMERA_MOUNT_TRANSLATION_M = (0.3, 0.0, 1.5)
-CAMERA_TILT_DEG = 45.0
+# Camera is head-mounted, not chassis-mounted like stream_demo.py's front_camera - this asset
+# has a real 2-DOF head (Head_Golf: head_joint1/head_joint2) with its own purpose-built sensor
+# mount point, head_end_effector_mount_link, found by walking the robot's full prim tree live
+# (not guessed). Nothing in this project drives the head joints, so it just sits at its rest
+# pose - but a head-mounted camera still moves with torso crouch (I/K), unlike a chassis-mounted
+# one, which stays at a fixed height/angle regardless of torso pose.
+HEAD_CAMERA_MOUNT = (
+    f"{ROBOT_PRIM}/OmniChassis/base_link/omni_chassis_base_link/omni_chassis_leg_mount_link/leg_base_link/"
+    "leg_link1/leg_link2/leg_link3/leg_link4/leg_link5/leg_end_effector_mount_link/torso_base_link/Head_Golf/"
+    "torso_base_link/torso_head_mount_link/head_base_link/head_link1/head_link2/head_end_effector_mount_link"
+)
+
+# The mount link's own local frame does not face the robot's forward direction - confirmed live
+# by rendering at identity orientation (showed a sideways, rolled view, not forward) and testing
+# candidate corrections: a +90deg rotation about local X (CAMERA_ROLL_DEG) is what re-aligns it,
+# tested by rendering and visually confirming a normal-looking horizon. CAMERA_TILT_DEG is then a
+# small *additional* downward pitch on top of that correction, composed via quat_multiply (pitch
+# applied after roll - see camera_head_mount_quat) - much smaller than a chassis mount would need
+# (10deg, not 45deg) because the head sits much higher and further forward than the chassis ever
+# did, so the look-down angle to a table-height box is shallow, not steep; confirmed by computing
+# the actual head-to-box world vector live rather than guessing. CAMERA_FOV_DEG is widened from
+# stream_demo.py's 60deg to help keep a nearby box in frame. All of this confirmed working for
+# the box-on-table view at the robot's normal ~0.9m parked distance - it does NOT reliably keep a
+# box in frame once it's held very close during the hug itself (a fixed camera angle geometrically
+# cannot frame a target whose angular position swings this much as it's brought close - a real
+# limitation, not yet solved here). Test this specifically once you can drive the arms live.
+CAMERA_ROLL_DEG = 90.0
+CAMERA_TILT_DEG = 10.0
+CAMERA_FOV_DEG = 90.0
 
 
-def camera_tilt_quat(tilt_deg: float) -> np.ndarray:
-    """Downward-pitch quaternion for Camera.set_local_pose's default "world" axes convention
-    (+Z up, +X forward, per that method's own docstring) - a positive rotation about Y tilts the
-    look direction from +X toward -Z (down). Verified live: rendered frames at several angles and
-    visually confirmed the table/box moved into frame as this angle increases.
+def quat_multiply(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
+    """Hamilton product q1*q2 (both (w,x,y,z)) - applying the result to a vector is equivalent to
+    applying q2 first, then q1. Verified against scipy.spatial.transform.Rotation's composition
+    before use (not just assumed correct)."""
+    w1, x1, y1, z1 = q1
+    w2, x2, y2, z2 = q2
+    return np.array(
+        [
+            w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+            w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+            w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+            w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+        ]
+    )
+
+
+def camera_head_mount_quat(roll_deg: float, tilt_deg: float) -> np.ndarray:
+    """Composed correction quaternion for the head camera mount - see HEAD_CAMERA_MOUNT's comment
+    for the derivation. Both component rotations use Camera.set_local_pose's default "world" axes
+    convention (+Z up, +X forward, per that method's own docstring): a positive rotation about X
+    is the roll correction, a positive rotation about Y (applied second, i.e. in the roll-
+    corrected frame) tilts the look direction down.
     """
-    half = np.radians(tilt_deg) / 2.0
-    return np.array([np.cos(half), 0.0, np.sin(half), 0.0])
+    roll_half = np.radians(roll_deg) / 2.0
+    roll_q = np.array([np.cos(roll_half), np.sin(roll_half), 0.0, 0.0])
+    tilt_half = np.radians(tilt_deg) / 2.0
+    tilt_q = np.array([np.cos(tilt_half), 0.0, np.sin(tilt_half), 0.0])
+    return quat_multiply(tilt_q, roll_q)
 
 # Real cardboard-box props from Isaac's warehouse/logistics environment set (plain generic
 # shipping boxes, not branded grocery items) - see spawn_real_box/make_box_dynamic below for why
@@ -775,7 +813,7 @@ def main() -> None:
         )
 
     camera = Camera(
-        prim_path=f"{ROBOT_PRIM}/OmniChassis/base_link/front_camera",
+        prim_path=f"{HEAD_CAMERA_MOUNT}/head_camera",
         frequency=20,
         resolution=(640, 480),
     )
@@ -788,8 +826,10 @@ def main() -> None:
     camera.add_distance_to_image_plane_to_frame()
 
     aperture = camera.get_horizontal_aperture()
-    camera.set_focal_length(float(aperture / (2.0 * np.tan(np.radians(60.0) / 2.0))))
-    camera.set_local_pose(translation=np.array(CAMERA_MOUNT_TRANSLATION_M), orientation=camera_tilt_quat(CAMERA_TILT_DEG))
+    camera.set_focal_length(float(aperture / (2.0 * np.tan(np.radians(CAMERA_FOV_DEG) / 2.0))))
+    camera.set_local_pose(
+        translation=np.array([0.0, 0.0, 0.0]), orientation=camera_head_mount_quat(CAMERA_ROLL_DEG, CAMERA_TILT_DEG)
+    )
 
     for _ in range(60):
         world.step(render=True)
@@ -819,7 +859,7 @@ def main() -> None:
         out_dir=args.out,
         fps=args.record_fps,
         state_names=state_names,
-        camera_key="front_camera",
+        camera_key="head_camera",
         image_hw=(480, 640),
         task_name=args.task,
     )
