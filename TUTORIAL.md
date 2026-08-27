@@ -12,11 +12,22 @@ a tunable, why conversion runs in a separate environment). This document is the 
 ## Prerequisites
 
 - An `isaac_sim` conda environment with Isaac Sim installed (used for `collect_pickplace_demo.py`
-  only — no `lerobot` needed here, and none of the streaming demo's `requirements.txt` deps
-  either).
+  only — no `lerobot` needed here). It also needs `aiortc`/`aiohttp`/`av` for the optional WebRTC
+  camera viewer below (same deps `stream_demo.py` needs) — these should already be present if
+  `stream_demo.py` has ever worked in this env.
 - Network access for Isaac Sim to resolve its Nucleus assets root path.
 - Later, for conversion/training: a separate environment with `pip install lerobot` — see
   Step 4.
+
+## Watching the robot's camera feed while collecting
+
+`collect_pickplace_demo.py` starts the same WebRTC server `stream_demo.py` uses
+(`streaming_server.py`), streaming just the RGB feed (no depth/lidar/map — this task doesn't use
+those sensors, so those panels on the browser page just stay blank). Open
+`http://<this machine's address>:8080/` (or whatever `--host`/`--port` you passed) and click
+Connect to watch live while teleoperating. This is purely for convenience — it has no effect on
+what actually gets recorded (the recorder samples the same camera independently, at a fixed rate,
+regardless of whether anyone's watching the stream).
 
 ## Step 0 — smoke test before recording anything real
 

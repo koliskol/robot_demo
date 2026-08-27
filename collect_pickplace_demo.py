@@ -9,6 +9,13 @@ Usage:
     conda run -n isaac_sim python collect_pickplace_demo.py
     conda run -n isaac_sim python collect_pickplace_demo.py --out ./raw_episodes --deck-riser 0.5
 
+Optionally open http://<host>:<port>/ (default http://0.0.0.0:8080/, see --host/--port) in a
+browser and click Connect to watch the robot's front camera live via WebRTC while teleoperating,
+same server as stream_demo.py (streaming_server.py) - just the RGB feed here, no depth/lidar/map
+(this task has no depth or lidar sensor; the depth/map panels in the browser page will just stay
+blank, harmlessly). Purely a convenience for watching the camera view without needing to line up
+Isaac Sim's own viewport on a second camera - has no effect on what's recorded.
+
 Controls (viewport window must have focus) - drive/jog controls are unchanged from
 stream_demo.py/../Robot_project/capture_cube_rgbd.py:
 
@@ -53,10 +60,13 @@ if the geometry doesn't work on the first try.
 
 Camera/lidar mounting and the arm/hand/torso jog constants mirror stream_demo.py and
 ../Robot_project/capture_cube_rgbd.py exactly (same Galbot G1 asset, same joint targets/clamps/
-rates) - see stream_demo.py's module docstring for the full derivation. This script drops the
-WebRTC streaming and lidar/depth entirely (not needed for offline data collection) and adds a
-pushcart + a graspable cube, ported/adapted from capture_cube_rgbd.py's build_pushcart and cube
-spawn (see those functions below for what changed and why).
+rates) - see stream_demo.py's module docstring for the full derivation. This script drops
+lidar/depth entirely (not needed for offline data collection, only RGB is recorded) and adds a
+pushcart + graspable boxes, ported/adapted from capture_cube_rgbd.py's build_pushcart and cube
+spawn (see those functions below for what changed and why). It reuses streaming_server.py's RGB
+video track (same as stream_demo.py) purely for live viewing convenience - streamed frames are
+NOT what gets recorded to disk; recording samples at a fixed rate via EpisodeRecorder below,
+independent of the WebRTC feed.
 """
 
 import argparse
@@ -65,6 +75,8 @@ from enum import Enum, auto
 from pathlib import Path
 
 parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+parser.add_argument("--host", type=str, default="0.0.0.0", help="WebRTC viewing server bind address.")
+parser.add_argument("--port", type=int, default=8080, help="WebRTC viewing server port.")
 parser.add_argument("--out", type=str, default="./raw_episodes", help="Output directory for recorded episodes.")
 parser.add_argument("--record-fps", type=float, default=15.0, help="Fixed sample rate for recorded episodes.")
 parser.add_argument("--task", type=str, default=None, help="Task name stored in each episode's manifest (default: derived from --cube-start).")
@@ -152,6 +164,8 @@ from isaacsim.robot.wheeled_robots.controllers.holonomic_controller import Holon
 from isaacsim.sensors.camera import Camera
 from isaacsim.storage.native import get_assets_root_path
 from pxr import Gf, PhysxSchema, Sdf, UsdGeom, UsdLux, UsdPhysics
+
+from streaming_server import FrameStore, run_in_background
 
 TABLE_ASSET = "/Isaac/Environments/Office/Props/SM_TableB.usd"
 ROBOT_ASSET = "/Isaac/Robots/Galbot/galbot_g1/galbot_g1.usda"
@@ -778,6 +792,12 @@ def main() -> None:
     hand_updown_rad = 0.0
     gripper_rad = 0.0
 
+    # Live viewing only (see module docstring) - not the recorder, which samples separately at a
+    # fixed rate below. No depth/lidar here, so the browser page's depth/map/point-cloud panels
+    # just stay blank; harmless.
+    frame_store = FrameStore()
+    run_in_background(frame_store, host=args.host, port=args.port)
+
     held_keys: set = set()
     reset_requested = False
     record_requested = False
@@ -925,10 +945,13 @@ def main() -> None:
 
         world.step(render=True)
 
+        rgba = camera.get_rgba()
+        if rgba is not None:
+            frame_store.update_rgb(rgba)
+
         record_accum += physics_dt
         if recorder_state is RecorderState.RECORDING and record_accum >= record_period:
             record_accum -= record_period
-            rgba = camera.get_rgba()
             if rgba is not None:
                 state_vec = robot.get_joint_positions()[state_dof_indices].astype(np.float32)
                 action_vec = np.concatenate([left_arm_q, right_arm_q, torso_q, left_gripper_q, right_gripper_q]).astype(

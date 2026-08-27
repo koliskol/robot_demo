@@ -117,8 +117,12 @@ deliberate config choice, not incidental.
 
 `collect_pickplace_demo.py` is a third sibling to `stream_demo.py`/`capture_cube_rgbd.py`, built
 the same way (copied and adapted, not imported — see the mirroring note above, which applies
-here too). It drops WebRTC/lidar/depth entirely (not needed for offline data collection) and
-adds a pushcart (`build_pushcart`, ported from `capture_cube_rgbd.py`) placed **adjacent** to the
+here too). It drops lidar/depth entirely (not needed for offline data collection) but does reuse
+`streaming_server.py`'s WebRTC RGB track — same server `stream_demo.py` uses — purely so you can
+watch the camera feed in a browser while teleoperating; this is unrelated to what actually gets
+recorded (`EpisodeRecorder` samples the same camera independently, at `--record-fps`, regardless
+of whether anyone's watching the live stream). It adds a pushcart (`build_pushcart`, ported from
+`capture_cube_rgbd.py`) placed **adjacent** to the
 table rather than across the room, so the task is pure fixed-base arm/gripper/torso manipulation
 — no driving during an episode, no base pose in the recorded state/action space (21 dims: both
 7-DOF arms, 5-DOF torso, both grippers). `--cube-start {table,cart}` controls where the box
