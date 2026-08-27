@@ -195,7 +195,19 @@ ROBOT_PRIM = "/World/Robot"
 # mount point, head_end_effector_mount_link, found by walking the robot's full prim tree live
 # (not guessed). Nothing in this project drives the head joints, so it just sits at its rest
 # pose - but a head-mounted camera still moves with torso crouch (I/K), unlike a chassis-mounted
-# one, which stays at a fixed height/angle regardless of torso pose.
+# one, which stays at a fixed height/angle regardless of torso pose. That coupling cuts both
+# ways: live-observed a large dark shape filling most of the frame when the torso is crouched
+# most of the way down (K held near max) *and* the arms are swung forward at the same time - this
+# is the robot's OWN torso/shoulder self-occluding the head-mounted camera's view, not a clipping
+# bug (confirmed via a controlled test: driving torso+arms to their crouched/forward poses under
+# the same clamp_to_actual scheme this file's main loop uses, not letting them free-fall-settle,
+# then rendering - the frame is dominated by the robot's own body, matching what was reported
+# live). Tilting the camera down further does NOT fix this - it was tested and made the robot's
+# own torso fill even more of the frame, not less, since the torso is what's now closest to the
+# lens once crouched this far. If the hand still isn't visible with the tilt below, try less
+# torso crouch (partial I/K) relying more on elbow lift (J/L) to keep the torso from being what's
+# directly in front of the camera - not something this file's constants alone can fix, since it
+# depends on how you jog the robot live.
 HEAD_CAMERA_MOUNT = (
     f"{ROBOT_PRIM}/OmniChassis/base_link/omni_chassis_base_link/omni_chassis_leg_mount_link/leg_base_link/"
     "leg_link1/leg_link2/leg_link3/leg_link4/leg_link5/leg_end_effector_mount_link/torso_base_link/Head_Golf/"
@@ -214,7 +226,7 @@ HEAD_CAMERA_MOUNT = (
 # stream_demo.py's 60deg to help keep a nearby box in frame. All of this confirmed working for
 # the box-on-table view at the robot's normal ~0.9m parked distance.
 CAMERA_ROLL_DEG = 90.0
-CAMERA_TILT_DEG = 10.0
+CAMERA_TILT_DEG = 15.0
 CAMERA_FOV_DEG = 90.0
 
 # Isaac Sim's Camera defaults to a 1.0m NEAR clipping plane (confirmed live via
@@ -224,9 +236,19 @@ CAMERA_FOV_DEG = 90.0
 # above never gets that close (robot stays parked ~0.9m back), but the hug itself absolutely
 # does. Confirmed the fix directly: with the default 1.0m clip, an object placed ~0.4m from the
 # lens rendered as nothing at all; with CAMERA_NEAR_CLIP_M applied, the same object is visible.
+#
+# 0.1, not smaller - a first attempt at 0.02 was live-tested and made the ENTIRE render go
+# almost black (mean pixel brightness dropped from ~195 to ~0.15, confirmed via a sweep: 0.02 and
+# 0.03 both broke it, 0.05 was still badly dark, 0.08 partially recovered, 0.1 and above matched
+# normal baseline brightness exactly) - independent of the far value, so this isn't the usual
+# near/far-ratio depth-precision story, more likely something specific to how the RTX renderer's
+# auto-exposure or a similar pass reacts to a near-zero near plane. 0.1 is still a real
+# improvement over the 1.0m default (confirmed a box at ~0.35m renders clearly at this setting)
+# without triggering whatever breaks at smaller values - do not lower this without re-testing
+# actual rendered brightness, not just whether the call succeeds.
 # CAMERA_FAR_CLIP_M is just tightened from the 1,000,000m default to something matching this
-# scene's actual scale - not itself part of the close-up fix.
-CAMERA_NEAR_CLIP_M = 0.02
+# scene's actual scale - not itself part of the close-up fix, and not implicated in the above.
+CAMERA_NEAR_CLIP_M = 0.1
 CAMERA_FAR_CLIP_M = 50.0
 
 

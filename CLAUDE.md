@@ -246,12 +246,13 @@ all (confirmed by rendering at identity orientation — showed a sideways, rolle
 90° roll correction (`CAMERA_ROLL_DEG`) before any additional downward pitch makes sense; that
 correction is composed via `quat_multiply`/`camera_head_mount_quat`, verified against
 `scipy.spatial.transform.Rotation`'s composition before trusting it. The needed downward pitch
-(`CAMERA_TILT_DEG`) is much smaller here (10°) than the old chassis mount needed (45°), because
+(`CAMERA_TILT_DEG`, 15°) is much smaller here than the old chassis mount needed (45°), because
 the head sits much higher and further forward, so the look-down angle to a table-height box is
 shallow — confirmed by computing the actual head-to-box world vector live, not guessed by feel.
-FOV widened to `CAMERA_FOV_DEG` (90°) to help keep a nearby box in frame. Confirmed clear for the
-box-on-table view at the robot's normal ~0.9m parked distance. Pushcart framing is still not
-reliable, but that's the existing robot/cart y-alignment issue above, not something this mount
+FOV widened to `CAMERA_FOV_DEG` (90°) to help keep a nearby box in frame. Confirmed clear (and
+actually improved vs. the original 10°) for the box-on-table view at the robot's normal ~0.9m
+parked distance. Pushcart framing is still not reliable, but that's the existing robot/cart
+y-alignment issue above, not something this mount
 causes.
 
 **Isaac Sim's `Camera` defaults to a 1.0m near clipping plane** (confirmed live via
@@ -260,9 +261,32 @@ closer than 1m to the lens is silently not rendered at all. This was the actual 
 (and the robot's own hand) "disappearing" once brought close during the hug — not a framing/angle
 problem like the box-on-table case above, an outright render-time clip. Confirmed directly: with
 the default clip, an object ~0.4m from the lens rendered as nothing; with `CAMERA_NEAR_CLIP_M`
-(0.02m) applied via `camera.set_clipping_range()`, the same object is visible. `CAMERA_FAR_CLIP_M`
-(50m) is just tightened from the 1,000,000m default to match this scene's actual scale, unrelated
-to the close-up fix itself.
+applied via `camera.set_clipping_range()`, the same object is visible.
+
+**`CAMERA_NEAR_CLIP_M` is 0.1, not something smaller — a first attempt at 0.02 broke rendering
+entirely** (confirmed live via a sweep, not assumed): mean frame brightness collapsed from ~195
+to ~0.15 with `near=0.02` — independent of the far value (both 50m and the 1,000,000m default
+were equally broken at that near value). 0.03 and 0.05 were also broken/badly dark; 0.08 partially
+recovered; 0.1 and above exactly matched normal baseline brightness. This isn't the usual
+near/far-ratio depth-precision story (far value provably didn't matter) — more likely something
+specific to how the RTX renderer's auto-exposure or a similar pass reacts to a near-zero near
+plane. 0.1 is still a real improvement over the 1.0m default (confirmed a box at ~0.35m renders
+clearly) without triggering whatever breaks at smaller values — **do not lower this without
+re-testing actual rendered brightness**, not just whether `set_clipping_range()` succeeds without
+erroring, since the failure mode here is silent (no exception, just a near-black frame).
+`CAMERA_FAR_CLIP_M` (50m) is just tightened from the 1,000,000m default to match this scene's
+actual scale — confirmed not implicated in the near-value breakage above.
+
+**A dark shape filling most of the frame during a deep torso crouch + forward arm swing is the
+robot's own body, not a bug.** Confirmed via a controlled test (driving torso/arms to their
+crouched/forward poses through the same `clamp_to_actual` scheme `main()`'s loop uses, not
+letting them free-fall-settle, then rendering): once the torso is crouched most of the way down
+while the arms are also swung forward, the robot's own torso/shoulder ends up directly in front of
+the head-mounted camera, self-occluding it. Tilting down further makes this **worse**, not
+better — it was tested, and it just puts the torso even more squarely in frame, since the torso is
+now the closest thing to the lens. If the hand still isn't visible, the fix is less torso crouch
+(partial `I`/`K`) relying more on elbow lift (`J`/`L`) to keep the torso out of the camera's line
+of sight — a teleoperation-technique fix, not something tunable via these constants.
 
 **Recording is decoupled from LeRobot on purpose.** `collect_pickplace_demo.py` writes raw
 per-episode data (`manifest.json` + `data.npz` + `frames/*.png`) with zero `lerobot` dependency,
