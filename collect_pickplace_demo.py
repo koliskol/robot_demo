@@ -16,9 +16,11 @@ stream_demo.py/../Robot_project/capture_cube_rgbd.py:
     A / D       strafe left / right             the task itself is fixed-base: no driving is
     Q / E       rotate left / right             recorded as part of an episode's action space)
     I / K       hold to move torso up / down (leg lift joints)
-    U / O       hold to swing both arms forward / back out to open (shoulder joint only)
+    U / O       hold to swing both arms forward / back out to open (shoulder joint only) -
+                this is the hug motion: swinging forward compresses the box between the forearms
     J / L       hold to raise / lower both hands (elbow joint only)
-    M / N       hold to close / open both grippers
+    M / N       hold to close / open both grippers (optional - the hug, not the gripper, is the
+                primary hold; fingers can add a little extra contact but aren't required)
     R           reset the robot/cube/cart to spawn pose (also discards any in-progress episode)
 
     SPACE       toggle: start recording an episode / stop and await a label
@@ -28,18 +30,23 @@ stream_demo.py/../Robot_project/capture_cube_rgbd.py:
 
     Close the viewport window to exit.
 
-IMPORTANT - read before collecting any real data: this task requires the gripper to actually
-lift and carry a loose object, which neither this project nor ../Robot_project/
-capture_cube_rgbd.py has ever demonstrated. That sibling project's own history records that
-every *kinematic* grasp-assist attempt (a hand-authored FixedJoint, and Isaac Sim's own
-IsaacSurfaceGripper) reproducibly destabilized the whole robot when attached to this hand link,
-since it's actively driven by the articulation's own solver rather than a simple independently-
-jointed body. The only proven mechanism is friction-only pinch via GRIPPER_MAX_LEAD_RAD below -
-this script leans on that alone (a high-friction cube + a light cube mass), and does NOT attempt
-any joint-based/kinematic attach. Before recording anything, manually jog through one full
-pick-table / place-cart / pick-cart / place-table cycle and confirm it's physically stable and
-reachable - see PUSHCART_DECK_HALF_EXTENT / --deck-riser / ROBOT_APPROACH_GAP_M below for the
-knobs to turn if the geometry doesn't work on the first try.
+IMPORTANT - read before collecting any real data: this task requires holding and carrying a loose
+object, which neither this project nor ../Robot_project/capture_cube_rgbd.py has ever
+demonstrated. The chosen approach is a bimanual "hug" - both arms swinging forward (U) to
+compress the box between the forearms, rather than a single gripper's fingertip pinch - so
+--cube-size defaults bigger than a gripper-sized grasp would need (see below). This is still
+friction-only contact, same constraint as a gripper pinch would have been: ../Robot_project/
+capture_cube_rgbd.py's own history records that every *kinematic* grasp-assist attempt (a
+hand-authored FixedJoint, and Isaac Sim's own IsaacSurfaceGripper) reproducibly destabilized the
+whole robot when attached to a driven articulation link, since it's actively driven by the
+articulation's own solver rather than a simple independently-jointed body. Do not add any
+joint-based/kinematic attach mechanism to "help" the hug hold - if it isn't stable on friction
+alone (high-friction cube material + arm swing compression), the fix is cube
+size/mass/friction and swing-in distance, not a new attach primitive. Before recording anything,
+manually jog through one full pick-table / place-cart / pick-cart / place-table cycle and confirm
+the hug is physically stable and both arms can actually converge around the box from a single
+parked pose - see PUSHCART_DECK_HALF_EXTENT / --deck-riser / ROBOT_APPROACH_GAP_M below for the
+other knobs to turn if the geometry doesn't work on the first try.
 
 Camera/lidar mounting and the arm/hand/torso jog constants mirror stream_demo.py and
 ../Robot_project/capture_cube_rgbd.py exactly (same Galbot G1 asset, same joint targets/clamps/
@@ -66,8 +73,20 @@ parser.add_argument(
     help="Where the cube spawns on reset - run one session per direction to collect both "
     "table->cart and cart->table demonstrations.",
 )
-parser.add_argument("--cube-size", type=float, default=0.07, help="Cube side length in meters (kept small to fit the grasp margin).")
-parser.add_argument("--cube-mass", type=float, default=0.05, help="Cube mass in kg (kept light for friction-only grasping).")
+parser.add_argument(
+    "--cube-size",
+    type=float,
+    default=0.22,
+    help="Cube side length in meters. Sized for a bimanual hug-carry (both forearms compressing "
+    "the box), not a gripper fingertip pinch - bigger than earlier gripper-oriented defaults.",
+)
+parser.add_argument(
+    "--cube-mass",
+    type=float,
+    default=0.15,
+    help="Cube mass in kg - kept light-to-moderate since the hold is friction-only (arm "
+    "compression + high cube friction, see PhysicsMaterial below), not a joint-based attach.",
+)
 parser.add_argument(
     "--deck-riser",
     type=float,
@@ -125,6 +144,11 @@ WALL_THICKNESS = 0.1
 # body collides with the table/cart -> raise it).
 ROBOT_APPROACH_GAP_M = 0.9
 CART_TABLE_GAP_M = 0.15
+
+# A second table, purely decorative - not a pick/place target, not touched by the recorder or
+# the task/manifest. Placed far across the room from the table+cart cluster (which sits near the
+# origin), well clear of ROOM_MIN/ROOM_MAX's walls.
+SECOND_TABLE_POSITION = (8.0, -6.0)
 
 DRIVE_KEY_AXES = {
     carb.input.KeyboardInput.W: (0, 1.0),
@@ -489,6 +513,10 @@ def main() -> None:
     table_center_x = (table_aabb[0] + table_aabb[3]) / 2.0
     table_center_y = (table_aabb[1] + table_aabb[4]) / 2.0
     table_top_z = table_aabb[5]
+
+    # Second table - decorative only, not part of the recorded task (see SECOND_TABLE_POSITION).
+    add_reference_to_stage(usd_path=assets_root_path + TABLE_ASSET, prim_path="/World/Table2")
+    place_on_ground(bbox_cache, "/World/Table2", x=SECOND_TABLE_POSITION[0], y=SECOND_TABLE_POSITION[1])
 
     # Cart placed beside the table, front edge flush with the table's own near (-x) edge, so
     # both sit at the same approach depth and only differ in y - see ROBOT_APPROACH_GAP_M's

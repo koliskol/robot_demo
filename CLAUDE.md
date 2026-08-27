@@ -126,17 +126,22 @@ spawns on reset — run one recording session per value to collect both directio
 cart→table); the task name recorded in each episode's manifest defaults accordingly unless
 `--task` overrides it.
 
-**The central open risk is grasping itself.** Neither this project nor `capture_cube_rgbd.py` has
-ever demonstrated actually lifting and carrying a loose object — only pinching a fixed obstacle or
-a heavy pushcart handle. `capture_cube_rgbd.py`'s own comments record that every *kinematic* grasp
-assist tried on this hand link (a hand-authored `FixedJoint`, Isaac Sim's `IsaacSurfaceGripper`)
-reproducibly destabilized the whole robot, because the hand is an actively-driven articulation
-link, not a simple jointed body. `collect_pickplace_demo.py` therefore uses friction-only pinch
-exclusively (`GRIPPER_MAX_LEAD_RAD`, a high-friction `PhysicsMaterial` on the cube, a light cube
-mass) and must never grow a joint-based/kinematic attach mechanism — if grasping proves
-unreliable, the fix space is cube physics (size/mass/friction) and gripper lead-clamp tuning, not
-a new attach primitive. Run through one full pick/place/pick/place cycle by hand (see the
-script's module docstring, "Stage 0") before trusting any recorded data.
+**The central open risk is holding the object itself.** Neither this project nor
+`capture_cube_rgbd.py` has ever demonstrated actually lifting and carrying a loose object — only
+pinching a fixed obstacle or a heavy pushcart handle. The chosen approach is a bimanual **hug**
+(both arms swinging forward via `U` to compress the box between the forearms) rather than a
+single gripper's fingertip pinch — hence `--cube-size` defaulting to 0.22m, sized for that, not
+for a gripper's grasp margin; gripper open/close (`M`/`N`) is optional extra contact, not the
+primary hold. This is still friction-only contact, so the same constraint applies as would have
+applied to a gripper pinch: `capture_cube_rgbd.py`'s own comments record that every *kinematic*
+grasp assist tried on this hand link (a hand-authored `FixedJoint`, Isaac Sim's
+`IsaacSurfaceGripper`) reproducibly destabilized the whole robot, because the hand is an
+actively-driven articulation link, not a simple jointed body. Never grow a joint-based/kinematic
+attach mechanism to stabilize the hug — if it proves unreliable, the fix space is cube
+size/mass/friction and arm swing-in distance, not a new attach primitive. Run through one full
+pick/place/pick/place cycle by hand (see the script's module docstring, "Stage 0") before
+trusting any recorded data — in particular, confirm both arms can actually converge around the
+box from a single parked robot pose without repositioning.
 
 **Cart deck height is a tunable, not a constant**: the pushcart's stock deck sits ~0.15m off the
 floor (designed for "push by the handle," not "place a box here"), almost certainly well below
