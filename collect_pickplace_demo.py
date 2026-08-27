@@ -142,8 +142,22 @@ parser.add_argument(
     "manual reach check described in the module docstring; raise it if the gripper can't get low enough "
     "over the deck to release the cube.",
 )
-parser.add_argument("--drive-speed", type=float, default=1.0, help="Chassis drive/strafe command magnitude.")
-parser.add_argument("--turn-speed", type=float, default=0.3, help="Chassis rotation command magnitude.")
+parser.add_argument(
+    "--drive-speed",
+    type=float,
+    default=0.4,
+    help="Chassis drive/strafe command magnitude. Lower than stream_demo.py's 1.0 default - at "
+    "1.0, live-observed the robot tipping over when driving fast, especially on diagonal "
+    "drive+strafe combos (command magnitude adds, can exceed 1.0). Only affects parking/"
+    "repositioning between episodes, not anything recorded.",
+)
+parser.add_argument(
+    "--turn-speed",
+    type=float,
+    default=0.15,
+    help="Chassis rotation command magnitude. Lower than stream_demo.py's 0.3 default, same "
+    "tip-over reasoning as --drive-speed.",
+)
 parser.add_argument("--arm-speed", type=float, default=0.4, help="Max arm joint speed in radians/second.")
 parser.add_argument("--torso-speed", type=float, default=0.4, help="Torso up/down speed, as a fraction/second of its full travel.")
 args = parser.parse_args()
@@ -198,13 +212,22 @@ HEAD_CAMERA_MOUNT = (
 # did, so the look-down angle to a table-height box is shallow, not steep; confirmed by computing
 # the actual head-to-box world vector live rather than guessing. CAMERA_FOV_DEG is widened from
 # stream_demo.py's 60deg to help keep a nearby box in frame. All of this confirmed working for
-# the box-on-table view at the robot's normal ~0.9m parked distance - it does NOT reliably keep a
-# box in frame once it's held very close during the hug itself (a fixed camera angle geometrically
-# cannot frame a target whose angular position swings this much as it's brought close - a real
-# limitation, not yet solved here). Test this specifically once you can drive the arms live.
+# the box-on-table view at the robot's normal ~0.9m parked distance.
 CAMERA_ROLL_DEG = 90.0
 CAMERA_TILT_DEG = 10.0
 CAMERA_FOV_DEG = 90.0
+
+# Isaac Sim's Camera defaults to a 1.0m NEAR clipping plane (confirmed live via
+# camera.get_clipping_range() - not a documented default anyone would guess) - anything closer
+# than that to the lens is silently not rendered at all, which is almost certainly why a box or
+# the robot's own hand "disappeared" once brought close during the hug: the box-on-table view
+# above never gets that close (robot stays parked ~0.9m back), but the hug itself absolutely
+# does. Confirmed the fix directly: with the default 1.0m clip, an object placed ~0.4m from the
+# lens rendered as nothing at all; with CAMERA_NEAR_CLIP_M applied, the same object is visible.
+# CAMERA_FAR_CLIP_M is just tightened from the 1,000,000m default to something matching this
+# scene's actual scale - not itself part of the close-up fix.
+CAMERA_NEAR_CLIP_M = 0.02
+CAMERA_FAR_CLIP_M = 50.0
 
 
 def quat_multiply(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
@@ -830,6 +853,7 @@ def main() -> None:
     camera.set_local_pose(
         translation=np.array([0.0, 0.0, 0.0]), orientation=camera_head_mount_quat(CAMERA_ROLL_DEG, CAMERA_TILT_DEG)
     )
+    camera.set_clipping_range(near_distance=CAMERA_NEAR_CLIP_M, far_distance=CAMERA_FAR_CLIP_M)
 
     for _ in range(60):
         world.step(render=True)

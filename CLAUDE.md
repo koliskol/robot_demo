@@ -219,6 +219,13 @@ already-stability-tuned caster joints — tune this empirically per the module d
 assuming a value. Likewise `ROBOT_APPROACH_GAP_M`/`CART_TABLE_GAP_M` (parking distance and
 cart-table clearance) are first guesses, not verified reach envelopes.
 
+**`--drive-speed`/`--turn-speed` default lower here (0.4/0.15) than `stream_demo.py`'s (1.0/0.3)**
+— live-observed the robot tipping over at the higher defaults, especially on diagonal drive+strafe
+key combos (command magnitude adds across axes, so holding two drive keys can exceed 1.0 even at
+`--drive-speed 1.0`). Only affects parking/repositioning between episodes, never anything
+recorded — raise them back via the flags if driving feels too sluggish and tipping isn't an issue
+for your setup.
+
 **Lighting is authored explicitly in `main()`** (a `DomeLight` + `DistantLight`, matching
 `stream_demo.py`'s `build_scene`) — `build_room` only builds walls, it was never responsible for
 lighting, and an earlier version of this script omitted lights entirely (scene was too dark to
@@ -243,14 +250,19 @@ correction is composed via `quat_multiply`/`camera_head_mount_quat`, verified ag
 the head sits much higher and further forward, so the look-down angle to a table-height box is
 shallow — confirmed by computing the actual head-to-box world vector live, not guessed by feel.
 FOV widened to `CAMERA_FOV_DEG` (90°) to help keep a nearby box in frame. Confirmed clear for the
-box-on-table view at the robot's normal ~0.9m parked distance; **does not** reliably keep a box in
-frame once it's held very close during the hug itself — a fixed camera angle geometrically cannot
-frame a target whose angular position swings this much as it's brought close. Not solved here;
-test live once the arms can be driven through an actual hug motion, since a synthetic "teleport a
-box to a guessed hold position" test turned out unreliable (the box position depends on
-uncontrolled joint settling, which isn't deterministic run to run). Pushcart framing is still not
-reliable either, but that's the existing robot/cart y-alignment issue above, not something this
-mount causes.
+box-on-table view at the robot's normal ~0.9m parked distance. Pushcart framing is still not
+reliable, but that's the existing robot/cart y-alignment issue above, not something this mount
+causes.
+
+**Isaac Sim's `Camera` defaults to a 1.0m near clipping plane** (confirmed live via
+`camera.get_clipping_range()` — not a documented default anyone would guess), meaning anything
+closer than 1m to the lens is silently not rendered at all. This was the actual cause of the box
+(and the robot's own hand) "disappearing" once brought close during the hug — not a framing/angle
+problem like the box-on-table case above, an outright render-time clip. Confirmed directly: with
+the default clip, an object ~0.4m from the lens rendered as nothing; with `CAMERA_NEAR_CLIP_M`
+(0.02m) applied via `camera.set_clipping_range()`, the same object is visible. `CAMERA_FAR_CLIP_M`
+(50m) is just tightened from the 1,000,000m default to match this scene's actual scale, unrelated
+to the close-up fix itself.
 
 **Recording is decoupled from LeRobot on purpose.** `collect_pickplace_demo.py` writes raw
 per-episode data (`manifest.json` + `data.npz` + `frames/*.png`) with zero `lerobot` dependency,
