@@ -46,8 +46,13 @@ conda run -n isaac_sim python collect_pickplace_demo.py --cube-start table
 This opens the Isaac Sim viewport. The console prints a one-time geometry diagnostic:
 
 ```
-[geometry] table_top_z=0.720m  cart_deck_top_z=0.150m  delta=+0.570m  cube_scale=1.0 ...
+[geometry] table_top_z=0.517m  cart_deck_top_z=0.150m  delta=+0.367m  cube_scale=1.0 ...
 ```
+
+`table_top_z` is lower than the table asset's native ~0.75m because of `--table-height-scale`
+(default 0.69 - see the flag's own help text) - a height-only scale on the table's legs, added
+for easier arm reach, that leaves the tabletop's footprint (0.8m x 2.8m) untouched. Pass
+`--table-height-scale 1.0` for the native height, or any other factor to retune it.
 
 With the viewport focused, manually jog through **one full cycle** — don't worry about recording:
 
@@ -79,13 +84,36 @@ The boxes are real cardboard-box props from Isaac's warehouse/logistics asset se
 shipping boxes, not branded items) — plain colored cubes were dropped entirely. These ship as
 static (collision-only) meshes, so `make_box_dynamic()` explicitly authors rigid-body physics and
 overrides their mesh collision to `convexHull` (verified live: settles cleanly under gravity, no
-instability). A decorative second table sits far across the room — it's not part of the task,
-ignore it during this check. On `--cube-start table` sessions, two extra bigger boxes (distinct
+instability). On `--cube-start table` sessions, two extra bigger boxes (distinct
 real assets, `--cube2-scale`/`--cube3-scale` to resize further, spaced apart via `CUBE_ROW_GAP_M`)
 also spawn alongside the main one, for size variety — these are real pick-up targets too, not
 decoration; pass `--no-extra-boxes` for just the single box. They don't spawn on `--cube-start
-cart` sessions (the pushcart deck is too small to fit 3 boxes) — the main box alone is small
-enough to fit the deck (confirmed: 0.38m fits within the deck's 0.6m width).
+cart` or `--cube-start table2` sessions (the pushcart deck is too small to fit 3 boxes, and the
+extra boxes are only ever placed on table1's own surface) — the main box alone is small enough to
+fit the pushcart deck (confirmed: 0.38m fits within the deck's 0.6m width).
+
+### Pick/place target: pushcart or a second table
+
+By default the box's destination is the pushcart. Pass `--place-target table2` instead to use a
+second table (same asset/height as the main one) placed adjacent to it — a table→table variant of
+the same task, for a scenario where a nav/SLAM stack (not this repo) would later drive the robot
+between two distant tables and hand off to this fixed-base manipulation policy once parked in
+reach; the actual sim distance between the two tables doesn't matter for training this policy, so
+they're kept close (`TABLE2_GAP_M`) like the cart. Only one of {cart, table2} is ever built per
+session — pick one and pass a matching `--cube-start`:
+
+```
+conda run -n isaac_sim python collect_pickplace_demo.py --place-target table2 --cube-start table
+conda run -n isaac_sim python collect_pickplace_demo.py --place-target table2 --cube-start table2
+```
+
+`--cube-start` must be `table` or match `--place-target` (e.g. `--cube-start cart` requires
+`--place-target cart`, the default) — passing a mismatched pair exits with an argument error
+rather than building an inconsistent scene. Since table2 is the same full-size table as table1
+(0.8m × 2.8m — far too long to reach across from one parked pose), the actual pick/place point
+sits `TABLE2_EDGE_INSET_M` onto its surface from the near edge, not its centroid; most of table2's
+surface is just for visual realism, out of reach, same as a real table is bigger than its contact
+patch.
 
 Do not move on to real recording until one full pick → place → pick → place cycle works reliably.
 

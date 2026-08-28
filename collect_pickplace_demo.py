@@ -86,12 +86,23 @@ parser.add_argument("--out", type=str, default="./raw_episodes", help="Output di
 parser.add_argument("--record-fps", type=float, default=15.0, help="Fixed sample rate for recorded episodes.")
 parser.add_argument("--task", type=str, default=None, help="Task name stored in each episode's manifest (default: derived from --cube-start).")
 parser.add_argument(
+    "--place-target",
+    type=str,
+    choices=["cart", "table2"],
+    default="cart",
+    help="Which secondary object the scene builds as the table's pick/place partner - the "
+    "pushcart (default, existing behavior) or a second table placed adjacent to the main one "
+    "(see TABLE2_GAP_M). Only one is ever built per session - they're alternative task variants, "
+    "not simultaneous targets (a single parked robot pose can't reach both at once).",
+)
+parser.add_argument(
     "--cube-start",
     type=str,
-    choices=["table", "cart"],
+    choices=["table", "cart", "table2"],
     default="table",
     help="Where the cube spawns on reset - run one session per direction to collect both "
-    "table->cart and cart->table demonstrations.",
+    "directions (table->X and X->table). Must be 'table' or match --place-target (e.g. "
+    "--cube-start cart requires --place-target cart).",
 )
 parser.add_argument(
     "--cube-scale",
@@ -135,6 +146,16 @@ parser.add_argument(
 )
 parser.add_argument("--no-extra-boxes", dest="extra_boxes", action="store_false", help="Spawn only the single primary box.")
 parser.add_argument(
+    "--table-height-scale",
+    type=float,
+    default=0.69,
+    help="Height-only scale factor for the main table (legs shortened, tabletop footprint "
+    "unchanged - see place_on_ground's z_scale param). Default lowers table_top_z from the "
+    "native ~0.72m to ~0.5m, for easier arm reach. 1.0 = native height. Re-check --deck-riser "
+    "via the Stage 0 manual reach check after changing this - it changes the table/cart height "
+    "delta printed in the startup [geometry] diagnostic.",
+)
+parser.add_argument(
     "--deck-riser",
     type=float,
     default=0.0,
@@ -161,8 +182,10 @@ parser.add_argument(
 parser.add_argument("--arm-speed", type=float, default=0.4, help="Max arm joint speed in radians/second.")
 parser.add_argument("--torso-speed", type=float, default=0.4, help="Torso up/down speed, as a fraction/second of its full travel.")
 args = parser.parse_args()
+if args.cube_start not in ("table", args.place_target):
+    parser.error(f"--cube-start {args.cube_start!r} requires --place-target {args.cube_start!r} (got --place-target {args.place_target!r})")
 if args.task is None:
-    args.task = "pick_box_table_to_cart" if args.cube_start == "table" else "pick_box_cart_to_table"
+    args.task = f"pick_box_table_to_{args.place_target}" if args.cube_start == "table" else f"pick_box_{args.place_target}_to_table"
 
 from isaacsim import SimulationApp
 
@@ -361,10 +384,15 @@ WALL_THICKNESS = 0.1
 ROBOT_APPROACH_GAP_M = 0.9
 CART_TABLE_GAP_M = 0.15
 
-# A second table, purely decorative - not a pick/place target, not touched by the recorder or
-# the task/manifest. Placed far across the room from the table+cart cluster (which sits near the
-# origin), well clear of ROOM_MIN/ROOM_MAX's walls.
-SECOND_TABLE_POSITION = (8.0, -6.0)
+# Table2 (--place-target table2) - an alternative to the pushcart: a second table, same asset and
+# height as the main one, placed adjacent to it (same near-edge-flush pattern as the cart, see
+# ROBOT_APPROACH_GAP_M's comment above). TABLE2_GAP_M mirrors CART_TABLE_GAP_M's role. Table2 uses
+# the full-size table asset (0.8 x 2.8m, same as table1), so unlike the small pushcart deck its own
+# centroid is far outside a parked robot's reach - TABLE2_EDGE_INSET_M places the actual pick/place
+# point a short distance onto table2's surface from its near edge instead, analogous to how the
+# small cart deck is reachable almost in its entirety.
+TABLE2_GAP_M = 0.15
+TABLE2_EDGE_INSET_M = 0.3
 
 # Gap (meters, edge to edge) between adjacent boxes when --extra-boxes lays out 3 side by side on
 # the table - kept generous so the boxes are clearly separate pick-up targets, not crowded
@@ -433,6 +461,24 @@ TORSO_HEIGHT_KEYS = {
     carb.input.KeyboardInput.I: -1.0,  # toward TORSO_UP_POSE
     carb.input.KeyboardInput.K: 1.0,  # toward TORSO_DOWN_POSE
 }
+
+# Starting arm/hand pose on launch and every reset - matches a specific teleoperated pose the
+# user confirmed live via a recorded episode (episode_0010, 2026-08-28: left/right arm_joint2
+# ~-1.067rad, arm_joint4 ~+1.173rad on both arms), not the fully-open rest pose. Expressed as
+# swing-fraction/hand-updown values (not raw joint angles) since that's what the jog loop below
+# actually drives - left/right fractions differ despite the near-identical recorded joint2 angle
+# because ARM_FORWARD_POSE's joint2 target differs per arm (asymmetric shoulder mount), while
+# arm_swing_rate normalizes both arms to the same physical rad/s, not fraction/s. The transition
+# from the USD asset's authored rest pose (0 rad) to this pose happens gradually (confirmed live:
+# smoothly converges over ~5s in free space, no instability) via the existing clamp_to_actual
+# mechanism already used for jogging - no direct joint teleport. The per-step lead cap
+# (ARM_CONTACT_MAX_LEAD_RAD) is not actually the limiting factor for this unobstructed motion -
+# confirmed live the joints track ~6x slower than the cap allows (presumably the drive's own
+# tracking bandwidth), so full convergence takes several seconds, not the single physics step the
+# lead cap alone would suggest.
+STARTING_LEFT_ARM_SWING_FRACTION = 0.815
+STARTING_RIGHT_ARM_SWING_FRACTION = 0.663
+STARTING_HAND_UPDOWN_RAD = 1.173
 
 MAX_JOINT_LEAD_RAD = 0.3
 # Tighter than stream_demo.py/capture_cube_rgbd.py's 0.1 rad - live-observed here (holding U
@@ -530,18 +576,24 @@ def compute_world_aabb(bbox_cache, prim_path: str) -> np.ndarray:
     return np.array([*r.GetMin(), *r.GetMax()])
 
 
-def place_on_ground(bbox_cache, prim_path: str, x: float, y: float, scale: float = 1.0) -> np.ndarray:
+def place_on_ground(bbox_cache, prim_path: str, x: float, y: float, scale: float = 1.0, z_scale: float = None) -> np.ndarray:
     """Move a freshly-referenced (identity-transform) prim so its footprint is centered at
     (x, y) and its lowest point rests on z=0. Ported from
     ../Robot_project/capture_cube_rgbd.py - needed here (unlike stream_demo.py, which hardcodes
     the table's position) so the table/cart/robot cluster's exact AABBs are known and
     reproducible, which the cart-adjacency placement below depends on.
+
+    `z_scale` defaults to `scale` (uniform scaling, the original behavior) but can be passed
+    separately to scale only the height - e.g. TABLE_HEIGHT_SCALE, which shortens the table's
+    legs without shrinking its tabletop footprint (used for box/cart placement elsewhere).
     """
-    aabb0 = compute_world_aabb(bbox_cache, prim_path) * scale
+    if z_scale is None:
+        z_scale = scale
+    aabb0 = compute_world_aabb(bbox_cache, prim_path) * np.array([scale, scale, z_scale, scale, scale, z_scale])
     center_x0 = (aabb0[0] + aabb0[3]) / 2.0
     center_y0 = (aabb0[1] + aabb0[4]) / 2.0
     position = np.array([x - center_x0, y - center_y0, -aabb0[2]])
-    SingleXFormPrim(prim_path, position=position, scale=np.array([scale, scale, scale]))
+    SingleXFormPrim(prim_path, position=position, scale=np.array([scale, scale, z_scale]))
     bbox_cache.Clear()
     return compute_world_aabb(bbox_cache, prim_path)
 
@@ -623,7 +675,7 @@ def spawn_real_box(
 # one change: a deck_riser_height parameter (see pushcart_deck_top_z / --deck-riser) inserted
 # between the caster assembly and the deck, since the stock ~0.15m deck height was designed for
 # "push by the handle," not "place a box here," and is likely well below table height.
-PUSHCART_DECK_HALF_EXTENT = (0.3, 0.225)
+PUSHCART_DECK_HALF_EXTENT = (0.45, 0.225)  # width (x) widened from 0.3 - see TUTORIAL.md's "0.6m width" note
 PUSHCART_DECK_THICKNESS = 0.03
 PUSHCART_WHEEL_RADIUS = 0.05
 PUSHCART_HANDLE_POST_HEIGHT = 0.75
@@ -838,27 +890,41 @@ def main() -> None:
     bbox_cache = bounds_utils.create_bbox_cache()
 
     add_reference_to_stage(usd_path=assets_root_path + TABLE_ASSET, prim_path="/World/Table")
-    table_aabb = place_on_ground(bbox_cache, "/World/Table", x=0.0, y=0.0)
+    table_aabb = place_on_ground(bbox_cache, "/World/Table", x=0.0, y=0.0, z_scale=args.table_height_scale)
     table_center_x = (table_aabb[0] + table_aabb[3]) / 2.0
     table_center_y = (table_aabb[1] + table_aabb[4]) / 2.0
     table_top_z = table_aabb[5]
 
-    # Second table - decorative only, not part of the recorded task (see SECOND_TABLE_POSITION).
-    add_reference_to_stage(usd_path=assets_root_path + TABLE_ASSET, prim_path="/World/Table2")
-    place_on_ground(bbox_cache, "/World/Table2", x=SECOND_TABLE_POSITION[0], y=SECOND_TABLE_POSITION[1])
-
-    # Cart placed beside the table, front edge flush with the table's own near (-x) edge, so
-    # both sit at the same approach depth and only differ in y - see ROBOT_APPROACH_GAP_M's
-    # comment above for why this exact layout is a first guess, not a verified one.
-    dx, dy = PUSHCART_DECK_HALF_EXTENT
-    cart_x = table_aabb[0] + dx
-    cart_y = table_aabb[4] + CART_TABLE_GAP_M + dy
-    build_pushcart(stage, "/World/PushCart", x=cart_x, y=cart_y, deck_riser_height=args.deck_riser)
+    # Pick/place partner - either the pushcart or a second table, chosen via --place-target (see
+    # that flag's help and TABLE2_GAP_M's comment above). Only one is ever built - they're
+    # alternative task variants, not simultaneous targets (a single parked robot pose can't reach
+    # both the cart and a full-size table2 at once).
+    if args.place_target == "cart":
+        # Cart placed beside the table, front edge flush with the table's own near (-x) edge, so
+        # both sit at the same approach depth and only differ in y - see ROBOT_APPROACH_GAP_M's
+        # comment above for why this exact layout is a first guess, not a verified one.
+        dx, dy = PUSHCART_DECK_HALF_EXTENT
+        target_x = table_aabb[0] + dx
+        target_y = table_aabb[4] + CART_TABLE_GAP_M + dy
+        build_pushcart(stage, "/World/PushCart", x=target_x, y=target_y, deck_riser_height=args.deck_riser)
+        target_top_z = pushcart_deck_top_z(args.deck_riser)
+    else:
+        table2_half_dx = (table_aabb[3] - table_aabb[0]) / 2.0
+        table2_half_dy = (table_aabb[4] - table_aabb[1]) / 2.0
+        add_reference_to_stage(usd_path=assets_root_path + TABLE_ASSET, prim_path="/World/Table2")
+        table2_aabb = place_on_ground(
+            bbox_cache, "/World/Table2",
+            x=table_aabb[0] + table2_half_dx, y=table_aabb[4] + TABLE2_GAP_M + table2_half_dy,
+            z_scale=args.table_height_scale,
+        )
+        target_x = table_center_x
+        target_y = table_aabb[4] + TABLE2_GAP_M + TABLE2_EDGE_INSET_M
+        target_top_z = table2_aabb[5]
 
     add_reference_to_stage(usd_path=assets_root_path + ROBOT_ASSET, prim_path=ROBOT_PRIM)
     stiffen_head_joints()
     robot_spawn_x = table_aabb[0] - ROBOT_APPROACH_GAP_M
-    robot_spawn_y = (table_center_y + cart_y) / 2.0  # centered between table and cart
+    robot_spawn_y = (table_center_y + target_y) / 2.0  # centered between table and the place-target
     place_on_ground(bbox_cache, ROBOT_PRIM, x=robot_spawn_x, y=robot_spawn_y)
 
     if args.cube_start == "table":
@@ -867,10 +933,9 @@ def main() -> None:
             x=table_center_x, y=table_center_y, surface_z=table_top_z, scale=args.cube_scale, mass=args.cube_mass,
         )
     else:
-        cart_deck_top_z_for_spawn = pushcart_deck_top_z(args.deck_riser)
         main_box_aabb = spawn_real_box(
             bbox_cache, assets_root_path, BOX_ASSET_MAIN, "/World/Cube",
-            x=cart_x, y=cart_y, surface_z=cart_deck_top_z_for_spawn, scale=args.cube_scale, mass=args.cube_mass,
+            x=target_x, y=target_y, surface_z=target_top_z, scale=args.cube_scale, mass=args.cube_mass,
         )
 
     # Two extra, bigger boxes - table side only (see CUBE_ROW_GAP_M's comment: the pushcart deck
@@ -964,19 +1029,19 @@ def main() -> None:
     )
     recorder_state = RecorderState.IDLE
 
-    cart_deck_top_z = pushcart_deck_top_z(args.deck_riser)
     print(
-        f"[geometry] table_top_z={table_top_z:.3f}m  cart_deck_top_z={cart_deck_top_z:.3f}m  "
-        f"delta={table_top_z - cart_deck_top_z:+.3f}m  cube_scale={args.cube_scale}  "
-        f"(if delta is large and positive, raise --deck-riser; see module docstring's Stage 0 check)"
+        f"[geometry] table_top_z={table_top_z:.3f}m  {args.place_target}_top_z={target_top_z:.3f}m  "
+        f"delta={table_top_z - target_top_z:+.3f}m  cube_scale={args.cube_scale}  "
+        f"(if delta is large and positive and --place-target=cart, raise --deck-riser; "
+        f"see module docstring's Stage 0 check)"
     )
 
     left_arm_swing_rate = arm_swing_rate("left", args.arm_speed)
     right_arm_swing_rate = arm_swing_rate("right", args.arm_speed)
-    left_arm_swing_fraction = 0.0
-    right_arm_swing_fraction = 0.0
+    left_arm_swing_fraction = STARTING_LEFT_ARM_SWING_FRACTION
+    right_arm_swing_fraction = STARTING_RIGHT_ARM_SWING_FRACTION
     torso_height_fraction = 0.0
-    hand_updown_rad = 0.0
+    hand_updown_rad = STARTING_HAND_UPDOWN_RAD
     gripper_rad = 0.0
 
     # Live viewing only (see module docstring) - not the recorder, which samples separately at a
@@ -1054,10 +1119,10 @@ def main() -> None:
                 recorder_state = RecorderState.IDLE
             world.reset()
             robot.initialize()
-            left_arm_swing_fraction = 0.0
-            right_arm_swing_fraction = 0.0
+            left_arm_swing_fraction = STARTING_LEFT_ARM_SWING_FRACTION
+            right_arm_swing_fraction = STARTING_RIGHT_ARM_SWING_FRACTION
             torso_height_fraction = 0.0
-            hand_updown_rad = 0.0
+            hand_updown_rad = STARTING_HAND_UPDOWN_RAD
             gripper_rad = 0.0
             record_accum = 0.0
             continue

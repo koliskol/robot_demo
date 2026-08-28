@@ -158,17 +158,28 @@ through `"control"` (see the streaming architecture section above) — both driv
 `record_requested`/`label_success_requested`/etc. flags the keyboard handler sets, so
 `B`/`Y`/`F`/`Backspace` and the browser's
 Start/Stop/Success/Fail/Discard buttons are interchangeable inputs into one state machine. It adds
-a pushcart (`build_pushcart`, ported from
-`capture_cube_rgbd.py`) placed **adjacent** to the
+a pick/place partner placed **adjacent** to the
 table rather than across the room, so the task is pure fixed-base arm/gripper/torso manipulation
 — no driving during an episode, no base pose in the recorded state/action space (21 dims: both
-7-DOF arms, 5-DOF torso, both grippers). `--cube-start {table,cart}` controls where the box
-spawns on reset — run one recording session per value to collect both directions (table→cart and
-cart→table); the task name recorded in each episode's manifest defaults accordingly unless
-`--task` overrides it. On table-start sessions, two extra bigger boxes spawn by default
-(`--cube2-scale`/`--cube3-scale`, `--no-extra-boxes` to disable) as real pick-up targets for size
-variety — not on cart-start sessions, since the pushcart deck (`PUSHCART_DECK_HALF_EXTENT`) is
-too small to fit 3 boxes side by side. None of this is tracked in the recorded state/action
+7-DOF arms, 5-DOF torso, both grippers). `--place-target {cart,table2}` chooses which partner the
+scene builds — a pushcart (`build_pushcart`, ported from `capture_cube_rgbd.py`) or a second
+table (same asset/height as the main one, `TABLE2_GAP_M`/`TABLE2_EDGE_INSET_M`) — and only one is
+ever built per session; they're alternative task variants (table↔cart vs. table↔table2), not
+simultaneous targets, since a single parked robot pose can't reach both a cart and a full-size
+table2 at once. Unlike the small pushcart deck, table2 uses the same full-size table asset as the
+main table (0.8m × 2.8m) — far too long to reach across from one parked pose — so its actual
+pick/place point is `TABLE2_EDGE_INSET_M` onto its surface from the near edge, not its centroid;
+most of table2's surface sits out of reach, which is fine, real tables are bigger than their
+contact patch too. `--cube-start {table,cart,table2}` controls where the box spawns on reset (must
+be `table` or match `--place-target`) — run one recording session per value to collect both
+directions; the task name recorded in each episode's manifest defaults accordingly (e.g.
+`pick_box_table_to_table2`) unless `--task` overrides it. On table-start sessions, two extra
+bigger boxes spawn by default (`--cube2-scale`/`--cube3-scale`, `--no-extra-boxes` to disable) as
+real pick-up targets for size variety — only on `table`-start sessions (checked via
+`args.cube_start == "table"` alone, not `--place-target`), never on `cart`- or `table2`-start
+sessions, since the pushcart deck (`PUSHCART_DECK_HALF_EXTENT`) is too small to fit 3 boxes side
+by side and table2's extra-box placement was never added (it spawns extras on table1's surface
+specifically, not wherever the box starts). None of this is tracked in the recorded state/action
 (robot-only, 21 dims) — box choice only affects what the camera sees, the same way varying
 `--cube-scale` across sessions would.
 
