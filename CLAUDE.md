@@ -325,6 +325,27 @@ stiffer still (2000/100) barely helped further (~11°), so it isn't pushed beyon
 teleoperation (not a full-range flip every single second) should see less than this worst case,
 but some residual wobble during fast motion is expected, not eliminated.
 
+**Live camera pan/tilt calibration exists to find a better mount angle interactively, not just by
+editing constants and relaunching.** Arrow keys (Left/Right pan, Up/Down tilt) or the browser's
+rotate buttons adjust `camera_pan_deg`/`camera_tilt_deg` at runtime via `camera_pan_tilt_quat()`,
+printing the current values (on key release, or after each browser click) to paste back into
+`CAMERA_PAN_DEG`/`CAMERA_TILT_DEG` once satisfied. Adding pan required more than just plugging a
+third rotation into `camera_head_mount_quat`'s existing roll+tilt composition — naively rotating
+about a raw local axis (X, Y, or Z, tried in every composition order relative to the existing
+roll/tilt) reproducibly showed up as an unwanted **extra tilt** instead of a clean left/right pan,
+confirmed via many live render comparisons, not just one. Root cause, found by reading Isaac Sim's
+own source rather than guessing further: `Camera.set_local_pose(camera_axes="world")` (the
+default) silently right-multiplies the given orientation by a fixed correction matrix
+(`isaacsim.sensors.camera.camera.W_U_TRANSFORM`) before authoring it, and that correction doesn't
+commute cleanly with a naive extra local-axis rotation. `camera_pan_tilt_quat()` instead applies
+pan as a genuine **world-space yaw** (rotation about the global up axis) on top of the existing
+roll+tilt orientation, explicitly undoing and redoing that same correction matrix (`CAMERA_WU_QUAT`,
+the matrix converted to a quaternion) plus the mount's own live world rotation (read fresh each
+call, since it moves with the torso/arm chain) - confirmed live: the box shifts purely
+horizontally, with the horizon/amount-of-floor-visible unchanged, unlike every raw-axis attempt.
+At `pan_deg=0` this is mathematically guaranteed (and confirmed live) to reduce to exactly
+`camera_head_mount_quat(roll_deg, tilt_deg)`, so existing tuned defaults are unaffected.
+
 **Recording is decoupled from LeRobot on purpose.** `collect_pickplace_demo.py` writes raw
 per-episode data (`manifest.json` + `data.npz` + `frames/*.png`) with zero `lerobot` dependency,
 because `lerobot` isn't installed anywhere on this machine and installing it into the `isaac_sim`

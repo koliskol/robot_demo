@@ -12,6 +12,11 @@ const labelSuccessBtn = document.getElementById("label-success");
 const labelFailBtn = document.getElementById("label-fail");
 const labelDiscardBtn = document.getElementById("label-discard");
 
+const camUpBtn = document.getElementById("cam-up");
+const camDownBtn = document.getElementById("cam-down");
+const camLeftBtn = document.getElementById("cam-left");
+const camRightBtn = document.getElementById("cam-right");
+
 let controlChannel = null;
 
 function sendControl(message) {
@@ -24,6 +29,13 @@ recordToggleBtn.addEventListener("click", () => sendControl({ action: "toggle_re
 labelSuccessBtn.addEventListener("click", () => sendControl({ action: "label", value: "success" }));
 labelFailBtn.addEventListener("click", () => sendControl({ action: "label", value: "fail" }));
 labelDiscardBtn.addEventListener("click", () => sendControl({ action: "discard" }));
+
+// Signs match the server's CAMERA_ROTATE_KEYS_PAN/TILT (LEFT=+1, RIGHT=-1, DOWN=+1, UP=-1) -
+// confirmed live server-side: increasing pan rotates the view left, increasing tilt pitches down.
+camLeftBtn.addEventListener("click", () => sendControl({ action: "camera_rotate", axis: "pan", delta: 1 }));
+camRightBtn.addEventListener("click", () => sendControl({ action: "camera_rotate", axis: "pan", delta: -1 }));
+camDownBtn.addEventListener("click", () => sendControl({ action: "camera_rotate", axis: "tilt", delta: 1 }));
+camUpBtn.addEventListener("click", () => sendControl({ action: "camera_rotate", axis: "tilt", delta: -1 }));
 
 function updateRecorderStatus(status) {
   const state = status.state; // "IDLE" | "RECORDING" | "AWAITING_LABEL"

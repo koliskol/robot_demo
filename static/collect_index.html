@@ -14,6 +14,14 @@
   #recorder-badge.awaiting-label { background: #7a5a1f; color: #fff; }
   #recorder-bar button { padding: 0.3rem 0.8rem; }
   #recorder-bar button:disabled { opacity: 0.4; }
+  #camera-bar { padding: 0 1rem 0.75rem; display: flex; align-items: center; gap: 0.75rem; }
+  #camera-bar span { font-size: 0.85rem; color: #aaa; }
+  #camera-pad { display: grid; grid-template-columns: repeat(3, 2.2rem); grid-template-rows: repeat(2, 2.2rem); gap: 0.25rem; }
+  #camera-pad button { padding: 0; }
+  #cam-up { grid-column: 2; grid-row: 1; }
+  #cam-left { grid-column: 1; grid-row: 2; }
+  #cam-right { grid-column: 3; grid-row: 2; }
+  #cam-down { grid-column: 2; grid-row: 2; }
   main { padding: 0 1rem 1rem; display: flex; gap: 0.5rem; flex-wrap: wrap; }
   figure { margin: 0; flex: 1 1 420px; }
   figcaption { font-size: 0.85rem; color: #aaa; padding-bottom: 0.25rem; }
@@ -32,6 +40,15 @@
   <button id="label-success">Success (Y)</button>
   <button id="label-fail">Fail (F)</button>
   <button id="label-discard">Discard</button>
+</div>
+<div id="camera-bar">
+  <span>Camera calibration (also: arrow keys) - check the server console for the printed pan/tilt</span>
+  <div id="camera-pad">
+    <button id="cam-up" title="Tilt up">▲</button>
+    <button id="cam-left" title="Pan left">◀</button>
+    <button id="cam-right" title="Pan right">▶</button>
+    <button id="cam-down" title="Tilt down">▼</button>
+  </div>
 </div>
 <main>
   <figure>

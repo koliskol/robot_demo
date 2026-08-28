@@ -290,8 +290,17 @@ def hold_head_joints(robot: SingleArticulation, head_dof_indices: list) -> None:
 # stream_demo.py's 60deg to help keep a nearby box in frame. All of this confirmed working for
 # the box-on-table view at the robot's normal ~0.9m parked distance.
 CAMERA_ROLL_DEG = 90.0
-CAMERA_TILT_DEG = 15.0
+CAMERA_TILT_DEG = 26.7
 CAMERA_FOV_DEG = 90.0
+
+# Runtime camera pan/tilt calibration (LEFT/RIGHT/UP/DOWN keys, or the browser's rotate buttons -
+# see camera_pan_tilt_quat below). CAMERA_TILT_DEG above is the starting tilt; CAMERA_PAN_DEG is
+# the starting yaw (found via live calibration through this same mechanism, not the mount's
+# untouched default - see HEAD_CAMERA_MOUNT's own comment on the roll derivation). Whenever a
+# live session finds a better angle, the console prints the exact pan/tilt to paste back in here.
+CAMERA_PAN_DEG = 22.0
+CAMERA_ROTATE_KEY_SPEED_DEG_S = 20.0
+CAMERA_ROTATE_STEP_DEG = 2.0  # per browser-button click
 
 # A dark curved shape intruding into the lower part of the frame (live-reported, then confirmed
 # via a physics raycast, not guessed) turned out to be part of the robot's OWN head housing
@@ -353,6 +362,45 @@ def camera_head_mount_quat(roll_deg: float, tilt_deg: float) -> np.ndarray:
     tilt_half = np.radians(tilt_deg) / 2.0
     tilt_q = np.array([np.cos(tilt_half), 0.0, np.sin(tilt_half), 0.0])
     return quat_multiply(tilt_q, roll_q)
+
+
+def quat_conjugate(q: np.ndarray) -> np.ndarray:
+    w, x, y, z = q
+    return np.array([w, -x, -y, -z])
+
+
+# Fixed quaternion equivalent of Camera.set_local_pose's own internal W_U_TRANSFORM - the
+# world-axes -> USD-native-axes correction it silently right-multiplies onto the given orientation
+# whenever camera_axes="world" (the default, confirmed by reading Isaac Sim's own source:
+# isaacsim.sensors.camera.camera.W_U_TRANSFORM = [[0,0,-1],[-1,0,0],[0,1,0]], converted to a
+# quaternion here). This constant is why camera_pan_tilt_quat below has to explicitly undo it (and
+# the mount's own world rotation) before applying a genuine world-space yaw, rather than just
+# adding a third raw-axis rotation into camera_head_mount_quat's composition - naively rotating
+# about a raw local X, Y, or Z axis was tried in every composition order (before/after/between the
+# existing roll+tilt) and reproducibly showed up as an unwanted EXTRA TILT instead of a clean pan
+# in every single case, confirmed via many live render comparisons - only this explicit undo
+# produces a genuinely decoupled left/right pan (confirmed live: the box shifts purely
+# horizontally, with the horizon/amount-of-floor-visible unchanged, unlike every raw-axis attempt).
+CAMERA_WU_QUAT = np.array([0.5, 0.5, -0.5, -0.5])
+
+
+def camera_pan_tilt_quat(roll_deg: float, tilt_deg: float, pan_deg: float, mount_world_quat: np.ndarray) -> np.ndarray:
+    """Local orientation for Camera.set_local_pose (relative to HEAD_CAMERA_MOUNT) that applies
+    `pan_deg` as a genuine world-space yaw (rotation about the global up axis) on top of the
+    existing roll+tilt correction (camera_head_mount_quat), regardless of the mount's own current
+    world orientation - pass `mount_world_quat` as HEAD_CAMERA_MOUNT's current world orientation
+    (read live: it moves with the torso/arm chain, even though nothing normally drives it away
+    from rest during calibration). At pan_deg=0 this is mathematically guaranteed to reduce to
+    exactly camera_head_mount_quat(roll_deg, tilt_deg), regardless of mount_world_quat.
+    """
+    q_base = camera_head_mount_quat(roll_deg, tilt_deg)
+    q_cam_world = quat_multiply(quat_multiply(mount_world_quat, q_base), CAMERA_WU_QUAT)
+    pan_half = np.radians(pan_deg) / 2.0
+    q_yaw = np.array([np.cos(pan_half), 0.0, 0.0, np.sin(pan_half)])
+    q_new_world = quat_multiply(q_yaw, q_cam_world)
+    q_new_local = quat_multiply(quat_multiply(quat_conjugate(mount_world_quat), q_new_world), quat_conjugate(CAMERA_WU_QUAT))
+    return q_new_local / np.linalg.norm(q_new_local)
+
 
 # Real cardboard-box props from Isaac's warehouse/logistics environment set (plain generic
 # shipping boxes, not branded grocery items) - see spawn_real_box/make_box_dynamic below for why
@@ -460,6 +508,20 @@ TORSO_DOWN_POSE = [0.8, 2.3, 1.55, 0.0, 0.0]
 TORSO_HEIGHT_KEYS = {
     carb.input.KeyboardInput.I: -1.0,  # toward TORSO_UP_POSE
     carb.input.KeyboardInput.K: 1.0,  # toward TORSO_DOWN_POSE
+}
+
+# Camera pan/tilt calibration keys (arrow keys - unused everywhere else in this file). Signs
+# confirmed live by rendering, not assumed: increasing CAMERA_PAN_DEG rotates the view to look
+# further LEFT (a centered object shifts toward the right edge of frame), increasing
+# CAMERA_TILT_DEG pitches further DOWN (a centered object shifts toward the bottom of frame, the
+# horizon rises) - see camera_pan_tilt_quat/camera_head_mount_quat.
+CAMERA_ROTATE_KEYS_PAN = {
+    carb.input.KeyboardInput.LEFT: 1.0,
+    carb.input.KeyboardInput.RIGHT: -1.0,
+}
+CAMERA_ROTATE_KEYS_TILT = {
+    carb.input.KeyboardInput.DOWN: 1.0,
+    carb.input.KeyboardInput.UP: -1.0,
 }
 
 # Starting arm/hand pose on launch and every reset - matches a specific teleoperated pose the
@@ -988,10 +1050,21 @@ def main() -> None:
 
     aperture = camera.get_horizontal_aperture()
     camera.set_focal_length(float(aperture / (2.0 * np.tan(np.radians(CAMERA_FOV_DEG) / 2.0))))
-    camera.set_local_pose(
-        translation=np.array([CAMERA_MOUNT_FORWARD_OFFSET_M, 0.0, 0.0]),
-        orientation=camera_head_mount_quat(CAMERA_ROLL_DEG, CAMERA_TILT_DEG),
-    )
+
+    camera_mount_prim = get_prim_at_path(HEAD_CAMERA_MOUNT)
+
+    def get_mount_world_quat() -> np.ndarray:
+        xf = UsdGeom.Xformable(camera_mount_prim).ComputeLocalToWorldTransform(0)
+        q = xf.ExtractRotationQuat()
+        return np.array([q.GetReal(), q.GetImaginary()[0], q.GetImaginary()[1], q.GetImaginary()[2]])
+
+    def set_camera_orientation(pan_deg: float, tilt_deg: float) -> None:
+        orientation = camera_pan_tilt_quat(CAMERA_ROLL_DEG, tilt_deg, pan_deg, get_mount_world_quat())
+        camera.set_local_pose(translation=np.array([CAMERA_MOUNT_FORWARD_OFFSET_M, 0.0, 0.0]), orientation=orientation)
+
+    camera_pan_deg = CAMERA_PAN_DEG
+    camera_tilt_deg = CAMERA_TILT_DEG
+    set_camera_orientation(camera_pan_deg, camera_tilt_deg)
     camera.set_clipping_range(near_distance=CAMERA_NEAR_CLIP_M, far_distance=CAMERA_FAR_CLIP_M)
 
     for _ in range(60):
@@ -1058,9 +1131,10 @@ def main() -> None:
     label_success_requested = False
     label_fail_requested = False
     discard_requested = False
+    camera_print_requested = False
 
     def on_keyboard_event(event, *_args, **_kwargs) -> bool:
-        nonlocal reset_requested, record_requested, label_success_requested, label_fail_requested, discard_requested
+        nonlocal reset_requested, record_requested, label_success_requested, label_fail_requested, discard_requested, camera_print_requested
         if event.type == carb.input.KeyboardEventType.KEY_PRESS:
             if event.input == carb.input.KeyboardInput.R:
                 reset_requested = True
@@ -1078,9 +1152,13 @@ def main() -> None:
                 or event.input in ARM_SWING_KEYS
                 or event.input in HAND_UPDOWN_KEYS
                 or event.input in GRIPPER_KEYS
+                or event.input in CAMERA_ROTATE_KEYS_PAN
+                or event.input in CAMERA_ROTATE_KEYS_TILT
             ):
                 held_keys.add(event.input)
         elif event.type == carb.input.KeyboardEventType.KEY_RELEASE:
+            if event.input in CAMERA_ROTATE_KEYS_PAN or event.input in CAMERA_ROTATE_KEYS_TILT:
+                camera_print_requested = True
             held_keys.discard(event.input)
         return True
 
@@ -1093,6 +1171,8 @@ def main() -> None:
     print("  Hold J: both hands raise (elbow only). Hold L: both hands lower.")
     print("  Hold M: both grippers close. Hold N: both grippers open.")
     print("  B: start/stop episode recording. After stop: Y=success, F=failure, Backspace=discard.")
+    print("  Arrow keys: rotate the camera (Left/Right pan, Up/Down tilt) - or use the browser's")
+    print("  rotate buttons. Prints pan/tilt on release - paste into CAMERA_PAN_DEG/CAMERA_TILT_DEG.")
     print("  R resets (also discards an in-progress episode). Close the window to exit.")
 
     physics_dt = world.get_physics_dt()
@@ -1110,6 +1190,24 @@ def main() -> None:
                 label_fail_requested = True
             elif cmd_action == "discard":
                 discard_requested = True
+            elif cmd_action == "camera_rotate":
+                delta = CAMERA_ROTATE_STEP_DEG * float(cmd.get("delta", 0.0))
+                if cmd.get("axis") == "pan":
+                    camera_pan_deg += delta
+                elif cmd.get("axis") == "tilt":
+                    camera_tilt_deg += delta
+                set_camera_orientation(camera_pan_deg, camera_tilt_deg)
+                print(
+                    f"[camera] pan={camera_pan_deg:+.1f}deg tilt={camera_tilt_deg:+.1f}deg  "
+                    f"(paste into CAMERA_PAN_DEG / CAMERA_TILT_DEG once you're happy)"
+                )
+
+        if camera_print_requested:
+            camera_print_requested = False
+            print(
+                f"[camera] pan={camera_pan_deg:+.1f}deg tilt={camera_tilt_deg:+.1f}deg  "
+                f"(paste into CAMERA_PAN_DEG / CAMERA_TILT_DEG once you're happy)"
+            )
 
         if reset_requested:
             reset_requested = False
@@ -1215,6 +1313,20 @@ def main() -> None:
         right_gripper_q = clamp_to_actual(np.array([gripper_rad]), actual_q[right_gripper_dof_indices], max_lead=GRIPPER_MAX_LEAD_RAD)
         robot.apply_action(ArticulationAction(joint_positions=left_gripper_q, joint_indices=left_gripper_dof_indices))
         robot.apply_action(ArticulationAction(joint_positions=right_gripper_q, joint_indices=right_gripper_dof_indices))
+
+        camera_rotation_changed = False
+        for key in held_keys:
+            if key in CAMERA_ROTATE_KEYS_PAN:
+                camera_pan_deg += CAMERA_ROTATE_KEYS_PAN[key] * CAMERA_ROTATE_KEY_SPEED_DEG_S * physics_dt
+                camera_rotation_changed = True
+            if key in CAMERA_ROTATE_KEYS_TILT:
+                camera_tilt_deg += CAMERA_ROTATE_KEYS_TILT[key] * CAMERA_ROTATE_KEY_SPEED_DEG_S * physics_dt
+                camera_rotation_changed = True
+        if camera_rotation_changed:
+            # Applied every step while held (for live visual feedback) but only printed on key
+            # release (see camera_print_requested) - printing at 60Hz while a key is held would
+            # spam the console.
+            set_camera_orientation(camera_pan_deg, camera_tilt_deg)
 
         hold_head_joints(robot, head_dof_indices)
 
