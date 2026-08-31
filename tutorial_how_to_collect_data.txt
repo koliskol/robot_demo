@@ -1,0 +1,29 @@
+1. Smoke test first (Stage 0)
+
+conda run -n isaac_sim python collect_pickplace_demo.py --cube-start table
+
+With the viewport focused, manually jog through one full pick-place cycle — don't record yet:
+- I/K torso crouch, U/O arm swing, J/L elbow height, to reach the cube on the table
+- M to grip it — check it holds without slipping or destabilizing the robot
+- Swing/crouch toward the cart, N to release it onto the deck
+
+Check the startup console line: [geometry] table_top_z=... cart_deck_top_z=... delta=.... If the gap is too large to reach, kill it and relaunch with --deck-riser <value> until placement works reliably.
+
+2. Record episodes
+
+conda run -n isaac_sim python collect_pickplace_demo.py --cube-start table --deck-riser <tuned value> --out ./raw_episodes
+
+Per episode: jog into position → B (start) → perform the pick-place → B (stop) → Y (success) / F (fail) / Backspace (discard) → R (reset for next episode).
+
+Then run a second session for the reverse direction:
+conda run -n isaac_sim python collect_pickplace_demo.py --cube-start cart --out ./raw_episodes
+Both sessions write into the same --out dir; episode numbering continues automatically.
+
+3. Sanity-check what you recorded
+
+python3 check_raw_episodes.py --raw-dir ./raw_episodes
+No conda env needed. Run this after a small test batch (2-3 episodes) before committing to a big session — it flags shape mismatches, NaNs, frozen (non-moving) episodes, and blank camera frames.
+
+4. Aim for volume
+
+~20-30+ successful episodes per direction as a starting point before training. Once you're happy with the data, convert_to_lerobot.py turns it into a LeRobotDataset (separate lerobot conda env — see CLAUDE.md).
