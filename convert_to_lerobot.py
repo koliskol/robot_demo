@@ -92,7 +92,7 @@ def main() -> None:
     state_names = manifest["state_names"]
     camera_key = manifest["camera"]["key"]
     height, width = manifest["camera"]["height"], manifest["camera"]["width"]
-    fps = manifest["fps"]
+    fps = int(manifest["fps"])
 
     dataset = LeRobotDataset.create(
         repo_id=args.repo_id,
