@@ -348,9 +348,29 @@ At `pan_deg=0` this is mathematically guaranteed (and confirmed live) to reduce 
 
 **Recording is decoupled from LeRobot on purpose.** `collect_pickplace_demo.py` writes raw
 per-episode data (`manifest.json` + `data.npz` + `frames/*.png`) with zero `lerobot` dependency,
-because `lerobot` isn't installed anywhere on this machine and installing it into the `isaac_sim`
-conda env risks conflicting with Isaac Sim's own pinned deps (opencv/av/gymnasium etc.).
-`convert_to_lerobot.py` has zero Isaac Sim imports and is meant to run in a separate, disposable
-`lerobot`-pip-installed env. Its exact `LeRobotDataset` API calls are unverified against a real
-install (the module docstring says what to check) — don't assume they're correct without testing
-against whatever lerobot version actually gets installed.
+because installing it into the `isaac_sim` conda env risks conflicting with Isaac Sim's own pinned
+deps (opencv/av/gymnasium etc.). `convert_to_lerobot.py` has zero Isaac Sim imports and is meant to
+run in a separate, disposable `lerobot`-pip-installed env (`conda create -n lerobot python=3.10 -y
+&& conda activate lerobot && pip install lerobot`).
+
+**Its `LeRobotDataset` API calls have now been confirmed against a real install (lerobot v0.6,
+`codebase_version: "v3.0"`)** — `create()`'s signature, `add_frame(dict)`, and `save_episode()`
+all matched the script's existing usage as originally written, with one exception: `create()`'s
+`fps` parameter is typed `int`, but `manifest.json` stores `fps` as a JSON float (`15.0`).
+Passing the float through reached PyAV's `add_stream()` during video encoding and crashed in
+`to_avrational` with `'float' object has no attribute 'numerator'` — fixed by casting
+`fps = int(manifest["fps"])` right where it's read from the manifest, before it reaches
+`create()`. Ran a full conversion (41 success-labeled episodes, 27,154 frames) and read every
+sample back via `LeRobotDataset(repo_id, root=...)` + indexing to confirm decoded video shape
+`[3, H, W]` and state/action shape `[21]` — this isn't just "the script exited 0", the output was
+actually loaded and inspected.
+
+**Video-frame decoding needs ffmpeg's shared libs present, and a system ffmpeg isn't enough by
+itself.** `lerobot`'s video backend is `torchcodec`, which ships prebuilt binaries pinned to a
+specific ffmpeg ABI/so-version. On a machine with no `ffmpeg` binary at all and only a mismatched
+system `libavutil.so.58` (torchcodec wanted `.so.56`/`.so.4`), reading back any sample (`ds[0]`)
+failed with `OSError: Could not load this library: .../libtorchcodec_core*.so`, even though
+dataset *creation*/encoding had already succeeded — the crash only surfaces on read, so a
+conversion run finishing without error is not proof the dataset is actually loadable. Fixed by
+`conda install -n lerobot -c conda-forge ffmpeg -y`, which drops matching-ABI shared libs inside
+the env itself rather than depending on whatever ffmpeg (if any) the system happens to have.
