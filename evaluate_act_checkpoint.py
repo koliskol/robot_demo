@@ -31,10 +31,9 @@ import numpy as np
 import torch
 from PIL import Image
 
-from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
-from lerobot.configs.policies import PreTrainedConfig
-from lerobot.policies.factory import make_policy, make_pre_post_processors
 from lerobot.utils.control_utils import predict_action
+
+from lerobot_policy_utils import load_policy
 
 
 def load_episode(episode_dir: Path) -> dict:
@@ -75,15 +74,9 @@ def main() -> None:
     episode_names = args.episodes if args.episodes else pick_default_episodes(raw_dir)
     print(f"Evaluating episodes: {episode_names}")
 
-    policy_cfg = PreTrainedConfig.from_pretrained(args.checkpoint_dir)
-    policy_cfg.pretrained_path = args.checkpoint_dir
-    policy_cfg.device = args.device
-    ds_meta = LeRobotDatasetMetadata(args.dataset_repo_id, root=args.dataset_root)
-    policy = make_policy(policy_cfg, ds_meta=ds_meta)
-    policy.eval()
-    preprocessor, postprocessor = make_pre_post_processors(policy_cfg, pretrained_path=args.checkpoint_dir)
-
-    camera_key = ds_meta.camera_keys[0]  # already the full feature name, e.g. "observation.images.head_camera"
+    policy, preprocessor, postprocessor, camera_key = load_policy(
+        args.checkpoint_dir, args.dataset_root, args.dataset_repo_id, device=args.device
+    )
     overall_errors = []
 
     for name in episode_names:

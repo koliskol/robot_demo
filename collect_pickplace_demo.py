@@ -82,8 +82,25 @@ from pathlib import Path
 parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
 parser.add_argument("--host", type=str, default="0.0.0.0", help="WebRTC viewing server bind address.")
 parser.add_argument("--port", type=int, default=8080, help="WebRTC viewing server port.")
-parser.add_argument("--out", type=str, default="./raw_episodes", help="Output directory for recorded episodes.")
+parser.add_argument("--out", type=str, default="./raw_episodes", help="Output directory for recorded episodes. Defaults to ./rollout_episodes instead when --rollout is set.")
 parser.add_argument("--record-fps", type=float, default=15.0, help="Fixed sample rate for recorded episodes.")
+parser.add_argument(
+    "--rollout",
+    action="store_true",
+    default=False,
+    help="Closed-loop rollout mode: instead of driving the arms/torso/grippers from held keys, "
+    "query a running policy_server.py over --policy-host/--policy-port at --record-fps and apply "
+    "its predicted joint targets (through the same clamp_to_actual() safety clamps teleop uses). "
+    "B/Y/F/Backspace/R still work exactly as in teleop mode - B also resets the policy's internal "
+    "state for a fresh attempt. Base driving (WASD/QE) still works for manual repositioning; the "
+    "policy only ever controls the 21 recorded arm/torso/gripper dims, matching CLAUDE.md's note "
+    "that this task has no base pose in its action space. See CLAUDE.md's \"LeRobot pick-and-place "
+    "pipeline\" for why this is a socket client, not an in-process policy load - unverified live "
+    "(no way to visually confirm a hug succeeds from a non-interactive session), re-check the "
+    "Stage 0-style reach cycle by eye before trusting it.",
+)
+parser.add_argument("--policy-host", type=str, default="127.0.0.1", help="policy_server.py host, only used with --rollout.")
+parser.add_argument("--policy-port", type=int, default=8765, help="policy_server.py port, only used with --rollout.")
 parser.add_argument("--task", type=str, default=None, help="Task name stored in each episode's manifest (default: derived from --cube-start).")
 parser.add_argument(
     "--place-target",
@@ -213,6 +230,11 @@ if args.cube_start not in ("table", args.place_target):
     parser.error(f"--cube-start {args.cube_start!r} requires --place-target {args.cube_start!r} (got --place-target {args.place_target!r})")
 if args.task is None:
     args.task = f"pick_box_table_to_{args.place_target}" if args.cube_start == "table" else f"pick_box_{args.place_target}_to_table"
+if args.rollout and args.out == parser.get_default("out"):
+    # Rollout attempts are policy predictions, not human demonstrations - default them into a
+    # separate directory so they never silently mix into raw_episodes/ training data. An explicit
+    # --out still overrides this, e.g. to intentionally fold graded rollouts back in later.
+    args.out = "./rollout_episodes"
 
 from isaacsim import SimulationApp
 
@@ -235,6 +257,7 @@ from isaacsim.storage.native import get_assets_root_path
 from pxr import Gf, PhysxSchema, Sdf, UsdGeom, UsdLux, UsdPhysics
 
 from streaming_server import FrameStore, run_in_background
+from policy_client import PolicyClient
 
 TABLE_ASSET = "/Isaac/Environments/Office/Props/SM_TableB.usd"
 ROBOT_ASSET = "/Isaac/Robots/Galbot/galbot_g1/galbot_g1.usda"
@@ -1164,6 +1187,16 @@ def main() -> None:
         f"see module docstring's Stage 0 check)"
     )
 
+    # --rollout: connect now and fail fast if policy_server.py isn't reachable - a --rollout run
+    # with no policy behind it is a misconfiguration, not a valid mode, so this deliberately
+    # doesn't fall back to teleop silently.
+    policy_client = None
+    policy_action_vec = None  # last action received from the server; None until the first predict
+    if args.rollout:
+        policy_client = PolicyClient(args.policy_host, args.policy_port)
+        policy_client.connect()
+        print(f"[rollout] connected to policy_server.py at {args.policy_host}:{args.policy_port}")
+
     left_arm_swing_rate = arm_swing_rate("left", args.arm_speed)
     right_arm_swing_rate = arm_swing_rate("right", args.arm_speed)
     left_arm_swing_fraction = STARTING_LEFT_ARM_SWING_FRACTION
@@ -1286,6 +1319,8 @@ def main() -> None:
             hand_updown_rad = STARTING_HAND_UPDOWN_RAD
             gripper_rad = 0.0
             record_accum = 0.0
+            if args.rollout:
+                policy_action_vec = None
             continue
 
         if record_requested:
@@ -1294,6 +1329,9 @@ def main() -> None:
                 recorder.start()
                 recorder_state = RecorderState.RECORDING
                 record_accum = 0.0
+                if args.rollout:
+                    policy_client.reset()
+                    policy_action_vec = None
                 print(f"[episode {recorder.episode_index:04d}] recording started")
             elif recorder_state is RecorderState.RECORDING:
                 recorder_state = RecorderState.AWAITING_LABEL
@@ -1335,45 +1373,84 @@ def main() -> None:
 
         actual_q = robot.get_joint_positions()
 
-        for key in held_keys:
-            if key in ARM_SWING_KEYS:
-                left_arm_swing_fraction += ARM_SWING_KEYS[key] * left_arm_swing_rate * physics_dt
-                right_arm_swing_fraction += ARM_SWING_KEYS[key] * right_arm_swing_rate * physics_dt
-        left_arm_swing_fraction = float(np.clip(left_arm_swing_fraction, 0.0, 1.0))
-        right_arm_swing_fraction = float(np.clip(right_arm_swing_fraction, 0.0, 1.0))
-        left_arm_q = (1.0 - left_arm_swing_fraction) * np.array(ARM_OPEN_POSE["left"]) + left_arm_swing_fraction * np.array(
-            ARM_FORWARD_POSE["left"]
-        )
-        right_arm_q = (1.0 - right_arm_swing_fraction) * np.array(
-            ARM_OPEN_POSE["right"]
-        ) + right_arm_swing_fraction * np.array(ARM_FORWARD_POSE["right"])
+        if args.rollout:
+            # policy_action_vec is the last full 21-dim vector received from policy_server.py (see
+            # the record_accum-gated query below) - None until the first prediction of an attempt
+            # arrives, during which the arms hold the exact same STARTING_*-fraction pose teleop
+            # mode's held_keys loop initializes left_arm_swing_fraction/right_arm_swing_fraction/
+            # hand_updown_rad to (NOT the fully-open pose - that's a materially different, more
+            # retracted pose, and defaulting to it here made the robot look frozen at launch since
+            # it's close to the raw spawn pose, with none of the visible ~5s settle-into-position
+            # motion teleop mode shows).
+            if policy_action_vec is not None:
+                left_arm_q = policy_action_vec[0:7].copy()
+                right_arm_q = policy_action_vec[7:14].copy()
+            else:
+                left_arm_q = (1.0 - STARTING_LEFT_ARM_SWING_FRACTION) * np.array(
+                    ARM_OPEN_POSE["left"]
+                ) + STARTING_LEFT_ARM_SWING_FRACTION * np.array(ARM_FORWARD_POSE["left"])
+                right_arm_q = (1.0 - STARTING_RIGHT_ARM_SWING_FRACTION) * np.array(
+                    ARM_OPEN_POSE["right"]
+                ) + STARTING_RIGHT_ARM_SWING_FRACTION * np.array(ARM_FORWARD_POSE["right"])
+                left_arm_q[ARM_HAND_UPDOWN_JOINT_INDEX] += STARTING_HAND_UPDOWN_RAD
+                right_arm_q[ARM_HAND_UPDOWN_JOINT_INDEX] += STARTING_HAND_UPDOWN_RAD
+        else:
+            for key in held_keys:
+                if key in ARM_SWING_KEYS:
+                    left_arm_swing_fraction += ARM_SWING_KEYS[key] * left_arm_swing_rate * physics_dt
+                    right_arm_swing_fraction += ARM_SWING_KEYS[key] * right_arm_swing_rate * physics_dt
+            left_arm_swing_fraction = float(np.clip(left_arm_swing_fraction, 0.0, 1.0))
+            right_arm_swing_fraction = float(np.clip(right_arm_swing_fraction, 0.0, 1.0))
+            left_arm_q = (1.0 - left_arm_swing_fraction) * np.array(ARM_OPEN_POSE["left"]) + left_arm_swing_fraction * np.array(
+                ARM_FORWARD_POSE["left"]
+            )
+            right_arm_q = (1.0 - right_arm_swing_fraction) * np.array(
+                ARM_OPEN_POSE["right"]
+            ) + right_arm_swing_fraction * np.array(ARM_FORWARD_POSE["right"])
 
-        for key in held_keys:
-            if key in HAND_UPDOWN_KEYS:
-                hand_updown_rad += HAND_UPDOWN_KEYS[key] * args.arm_speed * physics_dt
-        hand_updown_rad = float(np.clip(hand_updown_rad, -ARM_HAND_DOWN_MAX_RAD, ARM_HAND_UP_MAX_RAD))
-        left_arm_q[ARM_HAND_UPDOWN_JOINT_INDEX] += hand_updown_rad
-        right_arm_q[ARM_HAND_UPDOWN_JOINT_INDEX] += hand_updown_rad
+            for key in held_keys:
+                if key in HAND_UPDOWN_KEYS:
+                    hand_updown_rad += HAND_UPDOWN_KEYS[key] * args.arm_speed * physics_dt
+            hand_updown_rad = float(np.clip(hand_updown_rad, -ARM_HAND_DOWN_MAX_RAD, ARM_HAND_UP_MAX_RAD))
+            left_arm_q[ARM_HAND_UPDOWN_JOINT_INDEX] += hand_updown_rad
+            right_arm_q[ARM_HAND_UPDOWN_JOINT_INDEX] += hand_updown_rad
 
+        # Safety-critical: this clamp (and the matching ones for torso/grippers below) is what
+        # guards against the joint-velocity-spike/fling failure mode documented in CLAUDE.md - it
+        # applies identically whether the pre-clamp target above came from a held key or a policy
+        # prediction, on purpose. Never let a --rollout target bypass this.
         left_arm_q = clamp_to_actual(left_arm_q, actual_q[left_arm_dof_indices], max_lead=ARM_CONTACT_MAX_LEAD_RAD)
         right_arm_q = clamp_to_actual(right_arm_q, actual_q[right_arm_dof_indices], max_lead=ARM_CONTACT_MAX_LEAD_RAD)
         robot.apply_action(ArticulationAction(joint_positions=left_arm_q, joint_indices=left_arm_dof_indices))
         robot.apply_action(ArticulationAction(joint_positions=right_arm_q, joint_indices=right_arm_dof_indices))
 
-        for key in held_keys:
-            if key in TORSO_HEIGHT_KEYS:
-                torso_height_fraction += TORSO_HEIGHT_KEYS[key] * args.torso_speed * physics_dt
-        torso_height_fraction = float(np.clip(torso_height_fraction, 0.0, 1.0))
-        torso_q = (1.0 - torso_height_fraction) * np.array(TORSO_UP_POSE) + torso_height_fraction * np.array(TORSO_DOWN_POSE)
+        if args.rollout:
+            torso_q = policy_action_vec[14:19].copy() if policy_action_vec is not None else np.array(TORSO_UP_POSE)
+        else:
+            for key in held_keys:
+                if key in TORSO_HEIGHT_KEYS:
+                    torso_height_fraction += TORSO_HEIGHT_KEYS[key] * args.torso_speed * physics_dt
+            torso_height_fraction = float(np.clip(torso_height_fraction, 0.0, 1.0))
+            torso_q = (1.0 - torso_height_fraction) * np.array(TORSO_UP_POSE) + torso_height_fraction * np.array(TORSO_DOWN_POSE)
         torso_q = clamp_to_actual(torso_q, actual_q[leg_indices])
         robot.apply_action(ArticulationAction(joint_positions=torso_q, joint_indices=leg_indices))
 
-        for key in held_keys:
-            if key in GRIPPER_KEYS:
-                gripper_rad += GRIPPER_KEYS[key] * GRIPPER_SPEED_RAD_S * physics_dt
-        gripper_rad = float(np.clip(gripper_rad, 0.0, GRIPPER_CLOSE_MAX_RAD))
-        left_gripper_q = clamp_to_actual(np.array([gripper_rad]), actual_q[left_gripper_dof_indices], max_lead=GRIPPER_MAX_LEAD_RAD)
-        right_gripper_q = clamp_to_actual(np.array([gripper_rad]), actual_q[right_gripper_dof_indices], max_lead=GRIPPER_MAX_LEAD_RAD)
+        if args.rollout:
+            if policy_action_vec is not None:
+                left_gripper_target = policy_action_vec[19:20].copy()
+                right_gripper_target = policy_action_vec[20:21].copy()
+            else:
+                left_gripper_target = np.array([0.0])
+                right_gripper_target = np.array([0.0])
+        else:
+            for key in held_keys:
+                if key in GRIPPER_KEYS:
+                    gripper_rad += GRIPPER_KEYS[key] * GRIPPER_SPEED_RAD_S * physics_dt
+            gripper_rad = float(np.clip(gripper_rad, 0.0, GRIPPER_CLOSE_MAX_RAD))
+            left_gripper_target = np.array([gripper_rad])
+            right_gripper_target = np.array([gripper_rad])
+        left_gripper_q = clamp_to_actual(left_gripper_target, actual_q[left_gripper_dof_indices], max_lead=GRIPPER_MAX_LEAD_RAD)
+        right_gripper_q = clamp_to_actual(right_gripper_target, actual_q[right_gripper_dof_indices], max_lead=GRIPPER_MAX_LEAD_RAD)
         robot.apply_action(ArticulationAction(joint_positions=left_gripper_q, joint_indices=left_gripper_dof_indices))
         robot.apply_action(ArticulationAction(joint_positions=right_gripper_q, joint_indices=right_gripper_dof_indices))
 
@@ -1405,13 +1482,22 @@ def main() -> None:
         record_accum += physics_dt
         if recorder_state is RecorderState.RECORDING and record_accum >= record_period:
             record_accum -= record_period
+            state_vec = robot.get_joint_positions()[state_dof_indices].astype(np.float32)
+            if args.rollout and rgba is not None:
+                # Query at the same record_fps cadence the policy was trained at. This is the
+                # observation-to-action edge of the loop: the frame/state captured just above
+                # becomes the target used by the joint-control block above on the *next* iteration
+                # (one physics step of latency, ~1/60s at default settings - negligible, and no
+                # different in kind from any real inference pipeline's latency).
+                policy_action_vec = policy_client.predict(rgba[:, :, :3], state_vec, args.task)
             if rgba is not None and depth is not None:
-                state_vec = robot.get_joint_positions()[state_dof_indices].astype(np.float32)
                 action_vec = np.concatenate([left_arm_q, right_arm_q, torso_q, left_gripper_q, right_gripper_q]).astype(
                     np.float32
                 )
                 recorder.append(rgba, depth, state_vec, action_vec)
 
+    if policy_client is not None:
+        policy_client.close()
     simulation_app.close()
 
 

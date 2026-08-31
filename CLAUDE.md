@@ -392,3 +392,62 @@ dataset *creation*/encoding had already succeeded — the crash only surfaces on
 conversion run finishing without error is not proof the dataset is actually loadable. Fixed by
 `conda install -n lerobot -c conda-forge ffmpeg -y`, which drops matching-ABI shared libs inside
 the env itself rather than depending on whatever ffmpeg (if any) the system happens to have.
+
+**Evaluating a trained checkpoint has two tiers, open-loop then closed-loop, because closed-loop
+needs a second process.** `evaluate_act_checkpoint.py` (runs in the `lerobot` env, zero Isaac Sim
+imports) replays recorded episodes frame-by-frame through the policy's real inference path
+(`policy.select_action()`) and compares predicted vs. recorded actions - fast and needs nothing
+but the `lerobot` env, but it's an in-sample, open-loop tracking check: the policy is always fed
+the *true* recorded observation, never what it would have seen after acting on its own prediction,
+so it says nothing about whether the policy can actually control the robot end-to-end. A first ACT
+checkpoint (table-to-table2, 35 episodes/23,307 frames, 30k steps) scored mean MAE 0.0068 rad
+across 3 episodes this way - a useful sanity check that training converged, not evidence the hug
+would succeed.
+
+Actually finding that out needs closed-loop rollout inside the real Isaac Sim scene, which can't
+be one script: policy inference needs `torch`/`lerobot`, which must not be installed into the
+`isaac_sim` conda env (same conflict-risk reasoning as the recording/conversion split above), so
+`collect_pickplace_demo.py --rollout` (isaac_sim env) and `policy_server.py` (lerobot env, loads a
+checkpoint via `lerobot_policy_utils.load_policy()` - the same loading path
+`evaluate_act_checkpoint.py` uses, factored out once it was needed by both) talk over a
+`127.0.0.1`-only TCP socket. Wire protocol lives in `policy_wire.py` (stdlib + numpy only, no
+torch/lerobot - safe to import from either env): 4-byte length prefix + JSON, numpy arrays as
+base64 with explicit shape/dtype - **not pickle**, even though this never leaves localhost, since
+avoiding an arbitrary-code-exec deserializer here costs nothing. `policy_client.py` (also stdlib +
+numpy only) is what `collect_pickplace_demo.py` imports. Confirmed live end-to-end from this
+session (no Isaac Sim involved, just the two processes talking): connect → reset → 5×predict all
+succeeded, returned `(21,)` finite `float32` vectors, ~8-9ms latency per predict after a ~280ms
+first-call warmup - comfortably inside the 67ms budget a 15Hz control loop allows.
+
+**Real finding, not assumed**: `predict_action()`'s own docstring claims it strips the batch
+dimension before returning; the installed `lerobot` (0.4.4) doesn't - it returns shape `(1, N)`
+(kept for vectorized-env compatibility upstream, where a real env step wants one action per parallel
+env). `policy_server.py` squeezes this explicitly (`action.squeeze(0)`) before sending it over the
+wire, rather than relying on numpy's broadcasting rules to silently paper over the extra dimension
+downstream (which is what let `evaluate_act_checkpoint.py`'s original in-process version pass
+without erroring - broadcasting a `(1, 21)` array into a `(21,)` slot works, so nothing flagged it
+until this was made explicit for the wire protocol). Don't trust that docstring for this lerobot
+version.
+
+`collect_pickplace_demo.py --rollout` reuses the *exact* same `clamp_to_actual()` calls (same
+per-group `max_lead` constants: `ARM_CONTACT_MAX_LEAD_RAD`/default `MAX_JOINT_LEAD_RAD`/
+`GRIPPER_MAX_LEAD_RAD`) teleop already uses - only the pre-clamp target's source changes (a policy
+prediction instead of a held-key-driven fraction). This is deliberate: those clamps are the guard
+against the joint-velocity-spike/fling failure mode described above, and they must apply
+identically no matter where the target came from. The policy is queried once per `record_fps` tick
+(matching the 15Hz rate training data was sampled at); between queries the same last-received
+target keeps getting re-applied every physics step, same as teleop's fraction state does between
+key-presses. `B`/`Y`/`F`/`Backspace`/`R` are unchanged - `B`-start now also calls
+`policy_client.reset()` (clears ACT's internal action-chunk queue for a fresh attempt) and `R`
+still re-triggers the box-jitter re-randomization already wired in, so every rollout attempt gets a
+fresh box pose. Rollout attempts record through the same generic `EpisodeRecorder`, defaulting to
+`./rollout_episodes` (not `raw_episodes/`) so policy predictions never silently mix into training
+data.
+
+**The Isaac Sim side of `--rollout` (does the robot actually move correctly, does the hug actually
+succeed) is unverified live** - the protocol and server were confirmed end-to-end as described
+above, but actually watching a rollout attempt play out in the Kit viewport / WebRTC stream and
+grading whether the hug succeeds needs a live, watched Isaac Sim session, which this session did
+not do. Run the Stage 0-style reach check by eye before trusting this for anything beyond a code
+read - same caveat as the box-jitter feature above, and for the same reason (no way to fake
+confidence on physical behavior that was never actually watched).
