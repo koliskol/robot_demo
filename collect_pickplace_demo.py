@@ -120,6 +120,33 @@ parser.add_argument(
     "since the hold is friction-only (arm compression), not a joint-based attach.",
 )
 parser.add_argument(
+    "--box-jitter-m",
+    type=float,
+    default=0.03,
+    help="Max random xy offset (meters) applied to the main box's spawn/reset position, sampled "
+    "fresh each episode (uniform over a disk of this radius, not a square). Previously the box "
+    "spawned at the exact same point every episode, which risks a policy that only ever learned "
+    "one pixel-perfect box pose. Keep this modest and re-check the Stage 0 manual reach cycle at "
+    "the extremes before widening it - ARM_FORWARD_POSE's hug convergence is tuned for one "
+    "specific position and hasn't been verified to hold up from an arbitrarily far-off start. "
+    "0 disables position jitter.",
+)
+parser.add_argument(
+    "--box-yaw-jitter-deg",
+    type=float,
+    default=10.0,
+    help="Max random yaw offset (degrees) applied to the main box's spawn/reset orientation, "
+    "sampled fresh each episode uniformly in [-value, +value]. Same reach-margin caution as "
+    "--box-jitter-m. 0 disables yaw jitter.",
+)
+parser.add_argument(
+    "--seed",
+    type=int,
+    default=None,
+    help="Seed for the box spawn-jitter RNG (--box-jitter-m/--box-yaw-jitter-deg). Default: a "
+    "fresh random sequence each run.",
+)
+parser.add_argument(
     "--cube2-scale",
     type=float,
     default=1.0,
@@ -638,6 +665,23 @@ def compute_world_aabb(bbox_cache, prim_path: str) -> np.ndarray:
     return np.array([*r.GetMin(), *r.GetMax()])
 
 
+def sample_box_jitter(rng: np.random.Generator, jitter_m: float, yaw_jitter_deg: float) -> tuple:
+    """Sample a random (dx, dy, yaw_deg, yaw_quat) offset for the main pick box's spawn/reset pose
+    - see --box-jitter-m/--box-yaw-jitter-deg. dx/dy are uniform over a disk (not a square) of
+    radius jitter_m, so every direction is equally likely rather than corners being favored. yaw
+    is uniform in [-yaw_jitter_deg, +yaw_jitter_deg] and returned both as degrees (for logging) and
+    as a quaternion in the same (w, x, y, z) / rotation-about-Z convention as quat_multiply/
+    camera_pan_tilt_quat above (safe to use directly as an orientation since the box's un-jittered
+    pose is axis-aligned identity orientation)."""
+    r = jitter_m * np.sqrt(rng.uniform(0.0, 1.0))
+    theta = rng.uniform(0.0, 2.0 * np.pi)
+    dx, dy = r * np.cos(theta), r * np.sin(theta)
+    yaw_deg = rng.uniform(-yaw_jitter_deg, yaw_jitter_deg)
+    yaw_half = np.radians(yaw_deg) / 2.0
+    yaw_quat = np.array([np.cos(yaw_half), 0.0, 0.0, np.sin(yaw_half)])
+    return dx, dy, yaw_deg, yaw_quat
+
+
 def place_on_ground(bbox_cache, prim_path: str, x: float, y: float, scale: float = 1.0, z_scale: float = None) -> np.ndarray:
     """Move a freshly-referenced (identity-transform) prim so its footprint is centered at
     (x, y) and its lowest point rests on z=0. Ported from
@@ -989,16 +1033,27 @@ def main() -> None:
     robot_spawn_y = (table_center_y + target_y) / 2.0  # centered between table and the place-target
     place_on_ground(bbox_cache, ROBOT_PRIM, x=robot_spawn_x, y=robot_spawn_y)
 
-    if args.cube_start == "table":
-        main_box_aabb = spawn_real_box(
-            bbox_cache, assets_root_path, BOX_ASSET_MAIN, "/World/Cube",
-            x=table_center_x, y=table_center_y, surface_z=table_top_z, scale=args.cube_scale, mass=args.cube_mass,
-        )
-    else:
-        main_box_aabb = spawn_real_box(
-            bbox_cache, assets_root_path, BOX_ASSET_MAIN, "/World/Cube",
-            x=target_x, y=target_y, surface_z=target_top_z, scale=args.cube_scale, mass=args.cube_mass,
-        )
+    # Random per-episode spawn pose for the main pick box (see --box-jitter-m/--box-yaw-jitter-deg)
+    # - box_center_x/y/box_surface_z are the tuned anchor (what used to be the exact, always-
+    # identical spawn point); box_xform/box_anchor_z are captured here so the reset_requested
+    # handler below can re-randomize the pose on every episode without re-running the
+    # scale-then-measure placement trick (place_on_surface requires an identity-transform prim,
+    # which "/World/Cube" no longer is after this first placement).
+    rng = np.random.default_rng(args.seed)
+    box_center_x, box_center_y = (table_center_x, table_center_y) if args.cube_start == "table" else (target_x, target_y)
+    box_surface_z = table_top_z if args.cube_start == "table" else target_top_z
+    box_dx, box_dy, box_yaw_deg, box_yaw_quat = sample_box_jitter(rng, args.box_jitter_m, args.box_yaw_jitter_deg)
+    main_box_aabb = spawn_real_box(
+        bbox_cache, assets_root_path, BOX_ASSET_MAIN, "/World/Cube",
+        x=box_center_x + box_dx, y=box_center_y + box_dy, surface_z=box_surface_z, scale=args.cube_scale, mass=args.cube_mass,
+    )
+    box_xform = SingleXFormPrim("/World/Cube")
+    box_xform.set_world_pose(orientation=box_yaw_quat)
+    box_anchor_z = float(box_xform.get_world_pose()[0][2])
+    print(
+        f"[box] initial spawn offset dx={box_dx:+.3f}m dy={box_dy:+.3f}m yaw={box_yaw_deg:+.1f}deg "
+        f"(--box-jitter-m={args.box_jitter_m} --box-yaw-jitter-deg={args.box_yaw_jitter_deg})"
+    )
 
     # Two extra, bigger boxes - table side only (see CUBE_ROW_GAP_M's comment: the pushcart deck
     # is too small to fit 3 boxes side by side). Not tracked in the recorded state/action (which
@@ -1217,6 +1272,14 @@ def main() -> None:
                 recorder_state = RecorderState.IDLE
             world.reset()
             robot.initialize()
+            box_dx, box_dy, box_yaw_deg, box_yaw_quat = sample_box_jitter(rng, args.box_jitter_m, args.box_yaw_jitter_deg)
+            box_xform.set_world_pose(
+                position=np.array([box_center_x + box_dx, box_center_y + box_dy, box_anchor_z]),
+                orientation=box_yaw_quat,
+            )
+            print(
+                f"[box] episode {recorder.episode_index:04d} spawn offset dx={box_dx:+.3f}m dy={box_dy:+.3f}m yaw={box_yaw_deg:+.1f}deg"
+            )
             left_arm_swing_fraction = STARTING_LEFT_ARM_SWING_FRACTION
             right_arm_swing_fraction = STARTING_RIGHT_ARM_SWING_FRACTION
             torso_height_fraction = 0.0

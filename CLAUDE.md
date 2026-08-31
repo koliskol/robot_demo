@@ -230,6 +230,24 @@ already-stability-tuned caster joints — tune this empirically per the module d
 assuming a value. Likewise `ROBOT_APPROACH_GAP_M`/`CART_TABLE_GAP_M` (parking distance and
 cart-table clearance) are first guesses, not verified reach envelopes.
 
+**The main pick box's spawn/reset pose is randomized per episode, not fixed.** Originally the box
+spawned at the exact same (x, y, yaw) every episode (including across `R`-triggered resets within
+one session), which risks training a policy that only ever saw one pixel-perfect box pose and
+doesn't generalize to any real-world placement error. `sample_box_jitter()` draws a fresh
+`(dx, dy, yaw)` each time — dx/dy uniform over a disk (not a square) of radius `--box-jitter-m`
+(default 0.03m) around the tuned anchor position, yaw uniform in `±--box-yaw-jitter-deg` (default
+10°) — applied both at initial spawn and, via `box_xform.set_world_pose()` right after
+`world.reset()`, on every subsequent reset. `--seed` makes the jitter sequence reproducible;
+default is a fresh sequence each run. **This is unverified live** (written without an Isaac Sim
+install available) — the specific risk is that `ARM_FORWARD_POSE`'s hug convergence was tuned
+against one exact box position, and hasn't been confirmed to still converge from the jittered
+extremes. Re-run the Stage 0 manual reach cycle after enabling this (it's on by default) and watch
+several resets play out before trusting it for a real collection session; lower `--box-jitter-m`/
+`--box-yaw-jitter-deg` (or pass `0` to disable either) if the hug stops reliably converging.
+Only the main box (`/World/Cube`) is randomized — the two decorative extra boxes (`Cube2`/`Cube3`,
+table-start only) stay at their fixed offsets from it, since they're untracked distractors, not
+the pick target.
+
 **`--drive-speed`/`--turn-speed` default lower here (0.4/0.15) than `stream_demo.py`'s (1.0/0.3)**
 — live-observed the robot tipping over at the higher defaults, especially on diagonal drive+strafe
 key combos (command magnitude adds across axes, so holding two drive keys can exceed 1.0 even at
