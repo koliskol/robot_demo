@@ -1,23 +1,26 @@
 # Tutorial: collecting pick-and-place data for a LeRobot policy
 
-This walks through using `collect_pickplace_demo.py`, `check_raw_episodes.py`, and
-`convert_to_lerobot.py` to record teleoperated demonstrations of a Galbot G1 robot picking a box
-up off a table, carrying it (bimanual hug, not the gripper) to a pushcart, and vice versa — and
-turning those recordings into a dataset a LeRobot policy (e.g. ACT) can train on.
+This walks through using `collect_pickplace_demo.py`, `check_raw_episodes.py`,
+`convert_to_lerobot.py`, `evaluate_act_checkpoint.py`, and `policy_server.py` to record
+teleoperated demonstrations of a Galbot G1 robot picking a box up off a table and placing it on a
+pushcart or a second table (bimanual hug, not the gripper) — training a LeRobot policy (e.g. ACT)
+on those recordings, and testing it both offline and live in Isaac Sim.
 
 If you haven't read it yet, `CLAUDE.md`'s "LeRobot pick-and-place pipeline" section covers the
-*why* behind the design choices here (why a hug instead of a gripper pinch, why the cart height is
-a tunable, why conversion runs in a separate environment). This document is the *how*.
+*why* behind the design choices here (why a hug instead of a gripper pinch, why conversion/
+training run in a separate environment, why the recorded action space grew from 21 to 22 dims,
+why pickup and place are now two separate policies). This document is the *how*.
 
 ## Prerequisites
 
 - An `isaac_sim` conda environment with Isaac Sim installed (used for `collect_pickplace_demo.py`
-  only — no `lerobot` needed here). It also needs `aiortc`/`aiohttp`/`av` for the optional WebRTC
-  camera viewer below (same deps `stream_demo.py` needs) — these should already be present if
-  `stream_demo.py` has ever worked in this env.
+  only — no `lerobot`/`torch` needed here, and installing it risks conflicting with Isaac Sim's own
+  pinned deps). It also needs `aiortc`/`aiohttp`/`av` for the WebRTC camera viewer (same deps
+  `stream_demo.py` needs) — these should already be present if `stream_demo.py` has ever worked in
+  this env.
 - Network access for Isaac Sim to resolve its Nucleus assets root path.
-- Later, for conversion/training: a separate environment with `pip install lerobot` — see
-  Step 4.
+- For conversion/training/evaluation/rollout inference: a separate `lerobot` environment — see
+  Step 3.
 
 ## Watching the robot's camera feed while collecting
 
@@ -92,6 +95,14 @@ cart` or `--cube-start table2` sessions (the pushcart deck is too small to fit 3
 extra boxes are only ever placed on table1's own surface) — the main box alone is small enough to
 fit the pushcart deck (confirmed: 0.38m fits within the deck's 0.6m width).
 
+The box's spawn/reset position and yaw are randomized a little each episode by default
+(`--box-jitter-m`, default 0.03m radius; `--box-yaw-jitter-deg`, default 10°) — every episode
+(including across `R`-triggered resets within a session) used to spawn the box at the exact same
+point, which risks a policy that only ever learned one pixel-perfect box pose. This is on by
+default; pass `0` to either flag to disable it. Console prints the sampled offset each episode.
+Keep this modest — the hug's arm pose (`ARM_FORWARD_POSE`) is tuned for one specific position, so
+if the hug stops reliably converging after widening these, narrow them back down.
+
 ### Pick/place target: pushcart or a second table
 
 By default the box's destination is the pushcart. Pass `--place-target table2` instead to use a
@@ -117,19 +128,58 @@ patch.
 
 Do not move on to real recording until one full pick → place → pick → place cycle works reliably.
 
-## Step 1 — record episodes
+## Two policies, not one continuous trajectory: pickup and place
 
-Once Step 0 works, start a real session:
+The task is split into **two independent, fixed-base policies**, handed off between by a
+navigation/SLAM stack that isn't part of this repo:
+
+- **`pickup`**: open arm → approach the box → hug → lift slightly → back away → end (SLAM takes
+  over from here).
+- **`place`**: SLAM has just parked the robot near the destination, robot is already holding the
+  box → approach the table/cart → lower slightly → open the arm wide (release) → back away → end
+  (SLAM takes over again).
+
+This means recording sessions for the two are structured differently, and **both now include the
+robot's own forward/backward chassis motion as part of what's recorded** (see the next section) —
+approach and retreat are supposed to be driven by the policy, not left to SLAM, so `W`/`S` during a
+recording is no longer just "parking between episodes," it's part of the demonstration.
+
+Label which policy a session is for with `--task`, which accepts any string:
 
 ```
-conda run -n isaac_sim python collect_pickplace_demo.py --cube-start table --deck-riser <tuned value> --out ./raw_episodes
+conda run -n isaac_sim python collect_pickplace_demo.py --cube-start table --task pickup_policy --out ./raw_episodes
+conda run -n isaac_sim python collect_pickplace_demo.py --place-target table2 --cube-start table2 --task place_policy --out ./raw_episodes
+```
+
+No new scene-setup mode was built for "place" episodes' already-holding-the-box starting
+condition — it's achieved the same way every episode's starting condition always has been: jog the
+robot into the hug pose (drive to the table, `U` to swing the arms around the box) *before*
+pressing `B`, then only the approach→lower→release→retreat portion actually gets recorded.
+
+**Recording boundaries matter now.** A `pickup` episode should end once the box is lifted and
+you've backed away a step or two — press `B` to stop there, don't continue into a full carry to
+the destination. A `place` episode should start already holding the box (from manually hugging it
+into position before `B`) and end once released and backed away. This is different from how the
+original data (still sitting in `raw_episodes/`, all labeled `pick_box_table_to_table2`/
+`pick_box_table_to_cart`) was collected — those are one continuous pick-to-place trajectory with
+no chassis motion at all, and are **21-dim**, incompatible with new 22-dim `pickup`/`place`
+recordings (see next section). They can't be mixed.
+
+## Step 1 — record episodes
+
+Once Step 0 works, start a real session (pick one of the two `--task` examples above depending on
+which policy you're recording for):
+
+```
+conda run -n isaac_sim python collect_pickplace_demo.py --cube-start table --task pickup_policy --deck-riser <tuned value> --out ./raw_episodes
 ```
 
 Controls during recording:
 
 | Key | Action |
 |---|---|
-| `W`/`S`/`A`/`D`/`Q`/`E` | drive/strafe/rotate — only for parking between episodes, not part of a recorded episode |
+| `W`/`S` | drive forward/back — **now part of the recorded action** (`chassis_forward`), used for the approach/retreat legs of each policy |
+| `A`/`D`/`Q`/`E` | strafe/rotate — still manual-only, not recorded, use for repositioning/correction |
 | `I`/`K` | torso up/down |
 | `U`/`O` | swing both arms forward/back (the hug) |
 | `J`/`L` | raise/lower both hands |
@@ -138,9 +188,10 @@ Controls during recording:
 | `Y` | (after stop) label the episode **success** and save it |
 | `F` | (after stop) label the episode **failure** and save it |
 | `Backspace` | (after stop) discard the episode, don't save |
-| `R` | reset robot/cube/cart to spawn (also discards an in-progress episode) |
+| `R` | reset robot/cube/cart to spawn, re-randomizes the box's jittered pose (also discards an in-progress episode) |
 
-Per episode: jog into position → `B` (start) → perform the hug-carry → `B` (stop) →
+Per episode: jog into position (for `place`, that means hugging the box first) → `B` (start) →
+perform the policy's motion (see the pickup/place step lists above) → `B` (stop) →
 `Y`/`F`/`Backspace` → `R` → repeat.
 
 Episodes land in `./raw_episodes/episode_0000/`, `episode_0001/`, ... regardless of session, each
@@ -149,26 +200,27 @@ containing:
 ```
 episode_0000/
   manifest.json           # success flag, fps, task name, joint names, frame count
-  data.npz                # observation.state (T,21) and action (T,21) float32 arrays
+  data.npz                # observation.state (T,22) and action (T,22) float32 arrays
   frames/NNNNNN_rgb.png   # RGB frame, one per recorded timestep
   frames/NNNNNN_depth.npy # raw depth (meters, float32, 480x640) for the same timestep -
                           # captured "just in case" a future policy wants it; not currently used
                           # by convert_to_lerobot.py (see that script's own docstring)
 ```
 
+The 22nd `state`/`action` dim is `chassis_forward` — asymmetric, unlike every other dim: state is
+the chassis's cumulative signed displacement (meters) along its own forward axis since the current
+recording attempt started (0.0 at the first frame, resets every `B`-start/`R`-reset — not an
+absolute world position), action is the forward/back drive *command* that tick (a velocity, not a
+position target). See `CLAUDE.md` for the full derivation.
+
 Depth also shows live in the browser viewer (a false-colored preview, same as `stream_demo.py`'s)
 alongside RGB, purely for your own viewing convenience — the recorded depth is the raw float
 array, not this colorized preview.
 
-Then record the reverse direction in a second session:
-
-```
-conda run -n isaac_sim python collect_pickplace_demo.py --cube-start cart --out ./raw_episodes
-```
-
-Both sessions share `--out`, so episode numbering continues automatically — no manual bookkeeping
-needed. Aim for roughly **20-30+ successful episodes per direction** as a starting point; more,
-and more varied approach angles, generally helps.
+Record the reverse direction (or the other policy) in a second session — both share `--out`, so
+episode numbering continues automatically, no manual bookkeeping needed. Aim for roughly **20-30+
+successful episodes per policy** as a starting point; more, and more varied approach angles/box
+poses, generally helps.
 
 ## Step 2 — sanity-check what you recorded
 
@@ -187,51 +239,126 @@ problem found, not just the first.
 ## Step 3 — convert to a LeRobot dataset
 
 This runs in a **separate environment**, not `isaac_sim` — see `CLAUDE.md` for why (`lerobot`'s
-dependencies could conflict with Isaac Sim's pinned versions of numpy/torch/opencv/etc.):
+dependencies could conflict with Isaac Sim's pinned versions of numpy/torch/opencv/etc.). Full
+setup, confirmed working end-to-end (not just "should work"):
 
 ```
 conda create -n lerobot python=3.10 -y
 conda activate lerobot
 pip install lerobot
+conda install -c conda-forge ffmpeg -y   # needed for reading the dataset back later (Step 5/6) -
+                                          # video decoding fails without a matching-ABI ffmpeg,
+                                          # even though conversion itself succeeds without it
 ```
 
-Before trusting the conversion script's exact API calls, check them against what actually got
-installed (the LeRobotDataset API has changed across releases and wasn't verified live while this
-script was written):
+Then convert (use a `--repo-id` that matches the `--task` you recorded with, e.g.
+`local/pickup_policy` for `pickup_policy` episodes):
 
 ```
-python -c "from lerobot.datasets.lerobot_dataset import LeRobotDataset; help(LeRobotDataset.create)"
-```
-
-Then convert:
-
-```
-python convert_to_lerobot.py --raw-dir ./raw_episodes --repo-id local/pick_box_table_to_cart --root ./lerobot_dataset
+python convert_to_lerobot.py --raw-dir ./raw_episodes --repo-id local/pickup_policy --root ./lerobot_dataset
 ```
 
 By default only episodes labeled **success** are included (`--include-failures` to add failures
-too — they stay on disk either way, nothing is deleted).
+too — they stay on disk either way, nothing is deleted). Verify the conversion actually worked,
+not just that it exited 0 (video decode failures only surface on *read*, not on write):
+
+```
+python -c "
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
+ds = LeRobotDataset('local/pickup_policy', root='./lerobot_dataset')
+print(ds.num_episodes, ds.num_frames, ds[0]['observation.state'].shape)
+"
+```
 
 ## Step 4 — train
 
-Still in the `lerobot` environment, once converted:
+Still in the `lerobot` environment, once converted (confirmed flags, `lerobot` 0.4.4 — check
+`lerobot-train --help` on your installed version, this shifts across releases):
 
 ```
-python -m lerobot.scripts.train --policy.type=act --dataset.repo_id=local/pick_box_table_to_cart \
-  --output_dir=./outputs/act_pickplace --batch_size=8 --steps=100000
+lerobot-train \
+  --dataset.repo_id=local/pickup_policy \
+  --dataset.root=./lerobot_dataset \
+  --dataset.image_transforms.enable=true \
+  --policy.type=act \
+  --policy.device=cuda \
+  --policy.push_to_hub=false \
+  --output_dir=./act_training/pickup_policy \
+  --job_name=act_pickup_policy \
+  --batch_size=8 \
+  --num_workers=2 \
+  --steps=30000 \
+  --save_freq=5000 \
+  --log_freq=100 \
+  --wandb.enable=false
 ```
 
-Check `lerobot-train --help` / `python -m lerobot.scripts.train --help` for the exact flags on
-your installed version — this has also shifted across releases.
+`--num_workers=2`/`--batch_size=8` are conservative defaults for a machine with limited system RAM
+alongside a 12GB GPU — raise them if you have headroom. On an RTX 4080-class GPU this took ~1 hour
+for 30k steps on a 35-episode dataset. Checkpoints land in `<output_dir>/checkpoints/NNNNNN/` plus
+a `checkpoints/last` symlink to the most recent one.
 
-Close Isaac Sim before training — data collection and training are separate processes run at
-different times, and the GPU may not have headroom for both at once (this machine has a 12GB
-card, often already partly used by other work).
+Close Isaac Sim before training if you're tight on GPU memory — data collection and training don't
+need to run at the same time.
+
+## Step 5 — evaluate offline (no Isaac Sim needed)
+
+Before investing in a live rollout test, sanity-check the checkpoint by replaying real recorded
+episodes through its actual inference path and comparing predicted vs. recorded actions:
+
+```
+conda run -n lerobot python evaluate_act_checkpoint.py \
+  --checkpoint-dir ./act_training/pickup_policy/checkpoints/last/pretrained_model \
+  --raw-dir ./raw_episodes --dataset-root ./lerobot_dataset --dataset-repo-id local/pickup_policy
+```
+
+This is an **in-sample, open-loop** check — the policy is fed the *true* recorded observation at
+every step, never what it would see after acting on its own prediction, so a low error here means
+training converged, not that the policy can control the robot end-to-end. See the script's own
+module docstring for details. Low/flat mean absolute error (a few hundredths of a radian) is a
+good sign; a policy that can't even track its own training data isn't worth testing live.
+
+## Step 6 — closed-loop rollout in Isaac Sim
+
+Real validation needs the policy actually driving the robot, consuming its own predictions'
+consequences frame after frame. This needs two processes (policy inference needs `torch`/
+`lerobot`, which can't go in the `isaac_sim` env) talking over a local socket:
+
+**Terminal 1 — start the policy server** (`lerobot` env):
+
+```
+conda run -n lerobot python policy_server.py \
+  --checkpoint-dir ./act_training/pickup_policy/checkpoints/last/pretrained_model \
+  --dataset-root ./lerobot_dataset --dataset-repo-id local/pickup_policy
+```
+
+**Terminal 2 — launch Isaac Sim in rollout mode** (`isaac_sim` env), matching whatever scene args
+the checkpoint was trained on (`--place-target`/`--cube-start` etc.):
+
+```
+conda run -n isaac_sim python collect_pickplace_demo.py --place-target table2 --cube-start table --rollout
+```
+
+The robot connects to the policy server at startup (fails loudly if it's not running — this
+doesn't fall back to teleop). `B`/`Y`/`F`/`Backspace`/`R` work exactly as in teleop mode: `B`
+starts a rollout attempt (also resets the policy's internal state), the policy drives the arms/
+torso/grippers/chassis-forward through the same safety clamps teleop uses, `Y`/`F`/`Backspace`
+label it, `R` resets and re-randomizes the box pose for the next attempt. Attempts record to
+`./rollout_episodes` by default (not `raw_episodes/` — these are policy predictions, not human
+demonstrations, and shouldn't silently mix into training data).
+
+**The checkpoint's dimension must match the current script's schema** — a 22-dim (`pickup_policy`/
+`place_policy`) checkpoint queried correctly will work; feeding it a 21-dim state (old-schema data)
+or vice versa fails loudly (a shape-mismatch crash), not silently. Don't mix them.
 
 ## Quick reference: file map
 
 | File | Runs in | Purpose |
 |---|---|---|
-| `collect_pickplace_demo.py` | `isaac_sim` conda env | Scene + keyboard teleop + episode recorder |
+| `collect_pickplace_demo.py` | `isaac_sim` conda env | Scene + keyboard teleop + episode recorder; `--rollout` for closed-loop policy control |
 | `check_raw_episodes.py` | plain `python3` | Validates recorded episodes before conversion |
-| `convert_to_lerobot.py` | separate `lerobot` env | Raw episodes → LeRobotDataset |
+| `convert_to_lerobot.py` | `lerobot` env | Raw episodes → LeRobotDataset |
+| `evaluate_act_checkpoint.py` | `lerobot` env | Offline, open-loop action-tracking check on a trained checkpoint |
+| `lerobot_policy_utils.py` | `lerobot` env | Shared checkpoint-loading helper (used by the two files above and `policy_server.py`) |
+| `policy_server.py` | `lerobot` env | Inference server for `--rollout` mode - loads a checkpoint, serves predictions over a local socket |
+| `policy_client.py` / `policy_wire.py` | `isaac_sim` env (stdlib + numpy only) | Client + wire protocol `collect_pickplace_demo.py --rollout` uses to talk to `policy_server.py` |
