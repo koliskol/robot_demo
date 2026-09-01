@@ -245,23 +245,49 @@ already-stability-tuned caster joints — tune this empirically per the module d
 assuming a value. Likewise `ROBOT_APPROACH_GAP_M`/`CART_TABLE_GAP_M` (parking distance and
 cart-table clearance) are first guesses, not verified reach envelopes.
 
-**The main pick box's spawn/reset pose is randomized per episode, not fixed.** Originally the box
-spawned at the exact same (x, y, yaw) every episode (including across `R`-triggered resets within
-one session), which risks training a policy that only ever saw one pixel-perfect box pose and
-doesn't generalize to any real-world placement error. `sample_box_jitter()` draws a fresh
-`(dx, dy, yaw)` each time — dx/dy uniform over a disk (not a square) of radius `--box-jitter-m`
-(default 0.03m) around the tuned anchor position, yaw uniform in `±--box-yaw-jitter-deg` (default
-10°) — applied both at initial spawn and, via `box_xform.set_world_pose()` right after
-`world.reset()`, on every subsequent reset. `--seed` makes the jitter sequence reproducible;
-default is a fresh sequence each run. **This is unverified live** (written without an Isaac Sim
-install available) — the specific risk is that `ARM_FORWARD_POSE`'s hug convergence was tuned
-against one exact box position, and hasn't been confirmed to still converge from the jittered
-extremes. Re-run the Stage 0 manual reach cycle after enabling this (it's on by default) and watch
-several resets play out before trusting it for a real collection session; lower `--box-jitter-m`/
-`--box-yaw-jitter-deg` (or pass `0` to disable either) if the hug stops reliably converging.
+**The main pick box's spawn/reset pose is randomized per episode, not fixed** — and so is table2's,
+as of a later addition (see below). Originally the box spawned at the exact same (x, y, yaw) every
+episode (including across `R`-triggered resets within one session), which risks training a policy
+that only ever saw one pixel-perfect box pose and doesn't generalize to any real-world placement
+error. `sample_pose_jitter()` (renamed from `sample_box_jitter()` once table2 started reusing it -
+it was already fully generic, box-specific in name only) draws a fresh `(dx, dy, yaw)` each time -
+dx/dy uniform over a disk (not a square) of radius `--box-jitter-m` (default 0.03m) around the
+tuned anchor position, yaw uniform in `±--box-yaw-jitter-deg` (default 10°) — applied both at
+initial spawn and, via `box_xform.set_world_pose()` right after `world.reset()`, on every
+subsequent reset. `--seed` makes the jitter sequence reproducible; default is a fresh sequence each
+run. **This is unverified live** (written without an Isaac Sim install available) — the specific
+risk is that `ARM_FORWARD_POSE`'s hug convergence was tuned against one exact box position, and
+hasn't been confirmed to still converge from the jittered extremes; the *default* 3cm/10° jitter is
+also small enough that it may not be visually obvious it's happening at all when watching the
+viewport - check the printed `[box] episode NNNN spawn offset dx=... dy=... yaw=...` console line
+each reset to confirm it's actually sampling different values, rather than assuming from a glance
+that nothing moved. Re-run the Stage 0 manual reach cycle after enabling this (it's on by default)
+and watch several resets play out before trusting it for a real collection session; lower
+`--box-jitter-m`/`--box-yaw-jitter-deg` (or pass `0` to disable either) if the hug stops reliably
+converging.
 Only the main box (`/World/Cube`) is randomized — the two decorative extra boxes (`Cube2`/`Cube3`,
 table-start only) stay at their fixed offsets from it, since they're untracked distractors, not
 the pick target.
+
+**Table2 itself is also jittered now** (`--table2-jitter-m`/`--table2-yaw-jitter-deg`, defaults
+0.05m/5° — a bit bigger than the box's default since imprecise destination placement matters less
+than imprecise grasp positioning, and a bit smaller on yaw since a full table rotating meaningfully
+changes the whole reach geometry far more than a small box does), same disk/reset pattern as the
+box, using the same now-generic `sample_pose_jitter()`. `rng` had to move earlier in `main()` (from
+just above the box's setup to just above the place-target build) since table2 is built before the
+box and now also needs it. `TABLE2_EDGE_INSET_M`'s reach point (`target_x`/`target_y`) shifts with
+table2's *initial* jitter sample so the two stay consistent at spawn, but does not keep re-tracking
+table2 on every subsequent `R`-reset (nothing in the main loop reads `target_x`/`target_y` again
+after scene setup, so this was never wired up) - **a known, currently-unaddressed edge case**: for
+`--cube-start table2` sessions specifically (box starts already on table2, not table1), the box's
+spawn anchor stays pinned to table2's *first* jittered position even as table2 keeps moving on
+later resets, so the box and table2 can drift out of alignment after a few resets in that
+configuration. Not an issue for the current `pickup_policy`/`place_policy` workflow (`pickup_policy`
+always uses `--cube-start table`; `place_policy` starts the box already held via manual hug, not
+auto-spawned on table2), but worth fixing properly before ever using `--cube-start table2` for real
+collection. Not yet implemented for `--place-target cart` (`table2_xform` stays `None` in that
+branch) - the cart is a 9-body dynamic assembly (see below), and jittering a dynamic multi-body
+prim the way the box was carries the same live-verification risk described above, doubled.
 
 **`--drive-speed`/`--turn-speed` default lower here (0.4/0.15) than `stream_demo.py`'s (1.0/0.3)**
 — live-observed the robot tipping over at the higher defaults, especially on diagonal drive+strafe

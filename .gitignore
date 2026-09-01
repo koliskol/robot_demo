@@ -4,5 +4,6 @@ captures/*
 !captures/.gitkeep
 raw_episodes/
 raw_episodes_cart/
+raw_pickup/
 lerobot_dataset/
 act_training/

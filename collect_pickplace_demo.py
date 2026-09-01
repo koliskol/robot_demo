@@ -113,6 +113,23 @@ parser.add_argument(
     "not simultaneous targets (a single parked robot pose can't reach both at once).",
 )
 parser.add_argument(
+    "--table2-jitter-m",
+    type=float,
+    default=0.05,
+    help="Max random xy offset (meters) applied to table2's spawn/reset position (only when "
+    "--place-target=table2), sampled fresh each episode same as --box-jitter-m - so place_policy "
+    "sessions see the destination table at a different spot each attempt, not always the exact "
+    "same place. 0 disables it. Ignored for --place-target=cart (not implemented there yet).",
+)
+parser.add_argument(
+    "--table2-yaw-jitter-deg",
+    type=float,
+    default=5.0,
+    help="Max random yaw offset (degrees) applied to table2's spawn/reset orientation, uniform in "
+    "[-value, +value]. Kept smaller than --box-yaw-jitter-deg by default - a full table rotating "
+    "meaningfully changes the reach geometry far more than a small box does. 0 disables it.",
+)
+parser.add_argument(
     "--cube-start",
     type=str,
     choices=["table", "cart", "table2"],
@@ -726,14 +743,15 @@ def compute_world_aabb(bbox_cache, prim_path: str) -> np.ndarray:
     return np.array([*r.GetMin(), *r.GetMax()])
 
 
-def sample_box_jitter(rng: np.random.Generator, jitter_m: float, yaw_jitter_deg: float) -> tuple:
-    """Sample a random (dx, dy, yaw_deg, yaw_quat) offset for the main pick box's spawn/reset pose
-    - see --box-jitter-m/--box-yaw-jitter-deg. dx/dy are uniform over a disk (not a square) of
+def sample_pose_jitter(rng: np.random.Generator, jitter_m: float, yaw_jitter_deg: float) -> tuple:
+    """Sample a random (dx, dy, yaw_deg, yaw_quat) offset for a spawn/reset pose - used for both
+    the main pick box (--box-jitter-m/--box-yaw-jitter-deg) and table2
+    (--table2-jitter-m/--table2-yaw-jitter-deg). dx/dy are uniform over a disk (not a square) of
     radius jitter_m, so every direction is equally likely rather than corners being favored. yaw
     is uniform in [-yaw_jitter_deg, +yaw_jitter_deg] and returned both as degrees (for logging) and
     as a quaternion in the same (w, x, y, z) / rotation-about-Z convention as quat_multiply/
-    camera_pan_tilt_quat above (safe to use directly as an orientation since the box's un-jittered
-    pose is axis-aligned identity orientation)."""
+    camera_pan_tilt_quat above (safe to use directly as an orientation since both objects' un-
+    jittered pose is axis-aligned identity orientation)."""
     r = jitter_m * np.sqrt(rng.uniform(0.0, 1.0))
     theta = rng.uniform(0.0, 2.0 * np.pi)
     dx, dy = r * np.cos(theta), r * np.sin(theta)
@@ -1062,14 +1080,21 @@ def main() -> None:
     table_center_y = (table_aabb[1] + table_aabb[4]) / 2.0
     table_top_z = table_aabb[5]
 
+    # rng created here (not down by the box, where it used to be) since table2's jitter below
+    # needs it too, and table2 is built before the box.
+    rng = np.random.default_rng(args.seed)
+
     # Pick/place partner - either the pushcart or a second table, chosen via --place-target (see
     # that flag's help and TABLE2_GAP_M's comment above). Only one is ever built - they're
     # alternative task variants, not simultaneous targets (a single parked robot pose can't reach
     # both the cart and a full-size table2 at once).
+    table2_xform = None
+    table2_anchor_x = table2_anchor_y = table2_anchor_z = None
     if args.place_target == "cart":
         # Cart placed beside the table, front edge flush with the table's own near (-x) edge, so
         # both sit at the same approach depth and only differ in y - see ROBOT_APPROACH_GAP_M's
-        # comment above for why this exact layout is a first guess, not a verified one.
+        # comment above for why this exact layout is a first guess, not a verified one. Not
+        # position-jittered yet (see --table2-jitter-m's help - table2 only, for now).
         dx, dy = PUSHCART_DECK_HALF_EXTENT
         target_x = table_aabb[0] + dx
         target_y = table_aabb[4] + CART_TABLE_GAP_M + dy
@@ -1079,13 +1104,25 @@ def main() -> None:
         table2_half_dx = (table_aabb[3] - table_aabb[0]) / 2.0
         add_reference_to_stage(usd_path=assets_root_path + TABLE_ASSET, prim_path="/World/Table2")
         table1_side_x = table_aabb[3] if TABLE2_SIDE_SIGN > 0 else table_aabb[0]
+        table2_anchor_x = table1_side_x + TABLE2_SIDE_SIGN * (TABLE2_GAP_M + table2_half_dx)
+        table2_anchor_y = table_center_y
+        table2_dx, table2_dy, table2_yaw_deg, table2_yaw_quat = sample_pose_jitter(
+            rng, args.table2_jitter_m, args.table2_yaw_jitter_deg
+        )
         table2_aabb = place_on_ground(
             bbox_cache, "/World/Table2",
-            x=table1_side_x + TABLE2_SIDE_SIGN * (TABLE2_GAP_M + table2_half_dx), y=table_center_y,
+            x=table2_anchor_x + table2_dx, y=table2_anchor_y + table2_dy,
             z_scale=args.table_height_scale,
         )
-        target_x = table1_side_x + TABLE2_SIDE_SIGN * (TABLE2_GAP_M + TABLE2_EDGE_INSET_M)
-        target_y = table_center_y
+        table2_xform = SingleXFormPrim("/World/Table2")
+        table2_xform.set_world_pose(orientation=table2_yaw_quat)
+        table2_anchor_z = float(table2_xform.get_world_pose()[0][2])
+        print(
+            f"[table2] initial spawn offset dx={table2_dx:+.3f}m dy={table2_dy:+.3f}m yaw={table2_yaw_deg:+.1f}deg "
+            f"(--table2-jitter-m={args.table2_jitter_m} --table2-yaw-jitter-deg={args.table2_yaw_jitter_deg})"
+        )
+        target_x = table2_anchor_x + TABLE2_SIDE_SIGN * TABLE2_EDGE_INSET_M + table2_dx
+        target_y = table2_anchor_y + table2_dy
         target_top_z = table2_aabb[5]
 
     add_reference_to_stage(usd_path=assets_root_path + ROBOT_ASSET, prim_path=ROBOT_PRIM)
@@ -1099,11 +1136,11 @@ def main() -> None:
     # identical spawn point); box_xform/box_anchor_z are captured here so the reset_requested
     # handler below can re-randomize the pose on every episode without re-running the
     # scale-then-measure placement trick (place_on_surface requires an identity-transform prim,
-    # which "/World/Cube" no longer is after this first placement).
-    rng = np.random.default_rng(args.seed)
+    # which "/World/Cube" no longer is after this first placement). rng was created earlier
+    # (before table2), shared between both.
     box_center_x, box_center_y = (table_center_x, table_center_y) if args.cube_start == "table" else (target_x, target_y)
     box_surface_z = table_top_z if args.cube_start == "table" else target_top_z
-    box_dx, box_dy, box_yaw_deg, box_yaw_quat = sample_box_jitter(rng, args.box_jitter_m, args.box_yaw_jitter_deg)
+    box_dx, box_dy, box_yaw_deg, box_yaw_quat = sample_pose_jitter(rng, args.box_jitter_m, args.box_yaw_jitter_deg)
     main_box_aabb = spawn_real_box(
         bbox_cache, assets_root_path, BOX_ASSET_MAIN, "/World/Cube",
         x=box_center_x + box_dx, y=box_center_y + box_dy, surface_z=box_surface_z, scale=args.cube_scale, mass=args.cube_mass,
@@ -1357,7 +1394,19 @@ def main() -> None:
                 recorder_state = RecorderState.IDLE
             world.reset()
             robot.initialize()
-            box_dx, box_dy, box_yaw_deg, box_yaw_quat = sample_box_jitter(rng, args.box_jitter_m, args.box_yaw_jitter_deg)
+            if table2_xform is not None:
+                table2_dx, table2_dy, table2_yaw_deg, table2_yaw_quat = sample_pose_jitter(
+                    rng, args.table2_jitter_m, args.table2_yaw_jitter_deg
+                )
+                table2_xform.set_world_pose(
+                    position=np.array([table2_anchor_x + table2_dx, table2_anchor_y + table2_dy, table2_anchor_z]),
+                    orientation=table2_yaw_quat,
+                )
+                print(
+                    f"[table2] episode {recorder.episode_index:04d} spawn offset dx={table2_dx:+.3f}m "
+                    f"dy={table2_dy:+.3f}m yaw={table2_yaw_deg:+.1f}deg"
+                )
+            box_dx, box_dy, box_yaw_deg, box_yaw_quat = sample_pose_jitter(rng, args.box_jitter_m, args.box_yaw_jitter_deg)
             box_xform.set_world_pose(
                 position=np.array([box_center_x + box_dx, box_center_y + box_dy, box_anchor_z]),
                 orientation=box_yaw_quat,
