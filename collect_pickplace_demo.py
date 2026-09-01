@@ -483,14 +483,21 @@ ROBOT_APPROACH_GAP_M = 0.9
 CART_TABLE_GAP_M = 0.15
 
 # Table2 (--place-target table2) - an alternative to the pushcart: a second table, same asset and
-# height as the main one, placed adjacent to it (same near-edge-flush pattern as the cart, see
-# ROBOT_APPROACH_GAP_M's comment above). TABLE2_GAP_M mirrors CART_TABLE_GAP_M's role. Table2 uses
-# the full-size table asset (0.8 x 2.8m, same as table1), so unlike the small pushcart deck its own
-# centroid is far outside a parked robot's reach - TABLE2_EDGE_INSET_M places the actual pick/place
-# point a short distance onto table2's surface from its near edge instead, analogous to how the
-# small cart deck is reachable almost in its entirety.
-TABLE2_GAP_M = 0.15
+# height as the main one, placed to table1's *side* - offset along X (table1's short, 0.8m axis)
+# rather than ahead along Y (table1's long, 2.8m axis), so the robot approaches table2's long
+# (2.8m) edge, not its narrow 0.8m end. table2_side_sign picks which side (+1 = table1's +X/xmax
+# side, -1 = -X/xmin side, same side the robot parks on) - flip it if the layout reads backward
+# once viewed live; nothing else depends on the sign. TABLE2_GAP_M can now be a real, walkable gap
+# (not the old near-zero clearance) because chassis_forward (see state_names) means the robot
+# actually driving there is now part of what the policy learns, not something to avoid - unlike
+# the old design, which kept this tight specifically so a single parked pose could reach table2 by
+# arm swing alone, since driving used to be invisible to the recorder. TABLE2_EDGE_INSET_M plays
+# the same role as before (the full 0.8 x 2.8m table's own centroid is still far outside reach),
+# just measured from table2's near X-facing edge now instead of its near Y-facing edge. Both are
+# first guesses, not verified live - same Stage 0 caveat as ROBOT_APPROACH_GAP_M above.
+TABLE2_GAP_M = 0.6
 TABLE2_EDGE_INSET_M = 0.3
+TABLE2_SIDE_SIGN = 1.0
 
 # Gap (meters, edge to edge) between adjacent boxes when --extra-boxes lays out 3 side by side on
 # the table - kept generous so the boxes are clearly separate pick-up targets, not crowded
@@ -1070,15 +1077,15 @@ def main() -> None:
         target_top_z = pushcart_deck_top_z(args.deck_riser)
     else:
         table2_half_dx = (table_aabb[3] - table_aabb[0]) / 2.0
-        table2_half_dy = (table_aabb[4] - table_aabb[1]) / 2.0
         add_reference_to_stage(usd_path=assets_root_path + TABLE_ASSET, prim_path="/World/Table2")
+        table1_side_x = table_aabb[3] if TABLE2_SIDE_SIGN > 0 else table_aabb[0]
         table2_aabb = place_on_ground(
             bbox_cache, "/World/Table2",
-            x=table_aabb[0] + table2_half_dx, y=table_aabb[4] + TABLE2_GAP_M + table2_half_dy,
+            x=table1_side_x + TABLE2_SIDE_SIGN * (TABLE2_GAP_M + table2_half_dx), y=table_center_y,
             z_scale=args.table_height_scale,
         )
-        target_x = table_center_x
-        target_y = table_aabb[4] + TABLE2_GAP_M + TABLE2_EDGE_INSET_M
+        target_x = table1_side_x + TABLE2_SIDE_SIGN * (TABLE2_GAP_M + TABLE2_EDGE_INSET_M)
+        target_y = table_center_y
         target_top_z = table2_aabb[5]
 
     add_reference_to_stage(usd_path=assets_root_path + ROBOT_ASSET, prim_path=ROBOT_PRIM)

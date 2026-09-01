@@ -180,8 +180,23 @@ real pick-up targets for size variety — only on `table`-start sessions (checke
 sessions, since the pushcart deck (`PUSHCART_DECK_HALF_EXTENT`) is too small to fit 3 boxes side
 by side and table2's extra-box placement was never added (it spawns extras on table1's surface
 specifically, not wherever the box starts). None of this is tracked in the recorded state/action
-(robot-only, 21 dims) — box choice only affects what the camera sees, the same way varying
-`--cube-scale` across sessions would.
+(robot-only, 21 dims originally, now 22 with `chassis_forward` — see below) — box choice only
+affects what the camera sees, the same way varying `--cube-scale` across sessions would.
+
+**Table2 was moved from ahead of table1 to its side, with a real (not token) gap, once
+`chassis_forward` existed to make driving there worth recording.** Originally table2 sat directly
+north of table1 (same X-center, offset a bare `TABLE2_GAP_M`=0.15m along Y) specifically so a
+single parked pose could reach it by arm swing alone, without any driving - the recorder used to
+have no way to capture chassis motion at all, so driving was something to design around, not use.
+Now that it can, per the user's own request ("move table2 farther left so the robot could move to
+the side of the table") table2 sits offset along X instead (table1's *short*, 0.8m axis) with
+`TABLE2_GAP_M` raised to 0.6m, so the robot approaches table2's *long* 2.8m edge rather than its
+narrow 0.8m end, and covering the gap is a deliberate, recordable drive rather than something to
+avoid. `TABLE2_SIDE_SIGN` (+1 = table1's +X/xmax side, the default; -1 = the other side, same side
+the robot parks on) picks which side - flip it if the layout reads backward once viewed live,
+nothing else depends on which sign is used. Unverified live, same as the box-jitter and rollout
+features above - re-run Step 0 to confirm the new reach distance/direction actually works before
+trusting it for a real `place_policy` session.
 
 **Boxes are real warehouse cardboard-box assets, not procedural cubes.** `spawn_real_box()`
 references three distinct real box props from Isaac's warehouse/logistics environment set

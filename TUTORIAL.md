@@ -106,12 +106,14 @@ if the hug stops reliably converging after widening these, narrow them back down
 ### Pick/place target: pushcart or a second table
 
 By default the box's destination is the pushcart. Pass `--place-target table2` instead to use a
-second table (same asset/height as the main one) placed adjacent to it — a table→table variant of
-the same task, for a scenario where a nav/SLAM stack (not this repo) would later drive the robot
-between two distant tables and hand off to this fixed-base manipulation policy once parked in
-reach; the actual sim distance between the two tables doesn't matter for training this policy, so
-they're kept close (`TABLE2_GAP_M`) like the cart. Only one of {cart, table2} is ever built per
-session — pick one and pass a matching `--cube-start`:
+second table (same asset/height as the main one) placed to table1's **side** — offset along
+table1's short (0.8m) axis, not ahead along its long (2.8m) axis, so the robot approaches table2's
+long 2.8m edge rather than its narrow end. The gap (`TABLE2_GAP_M`, 0.6m) is deliberately real now,
+not a token clearance — since `chassis_forward` records the drive there, covering that distance is
+part of what `place_policy` is supposed to learn, not something to design around. `TABLE2_SIDE_SIGN`
+picks which side table2 sits on; flip it in the script if the layout looks backward once viewed
+live. Only one of {cart, table2} is ever built per session — pick one and pass a matching
+`--cube-start`:
 
 ```
 conda run -n isaac_sim python collect_pickplace_demo.py --place-target table2 --cube-start table
