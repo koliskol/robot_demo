@@ -512,7 +512,7 @@ CART_TABLE_GAP_M = 0.15
 # the same role as before (the full 0.8 x 2.8m table's own centroid is still far outside reach),
 # just measured from table2's near X-facing edge now instead of its near Y-facing edge. Both are
 # first guesses, not verified live - same Stage 0 caveat as ROBOT_APPROACH_GAP_M above.
-TABLE2_GAP_M = 0.6
+TABLE2_GAP_M = 1.2
 TABLE2_EDGE_INSET_M = 0.3
 TABLE2_SIDE_SIGN = 1.0
 
