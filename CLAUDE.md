@@ -444,10 +444,69 @@ fresh box pose. Rollout attempts record through the same generic `EpisodeRecorde
 `./rollout_episodes` (not `raw_episodes/`) so policy predictions never silently mix into training
 data.
 
-**The Isaac Sim side of `--rollout` (does the robot actually move correctly, does the hug actually
-succeed) is unverified live** - the protocol and server were confirmed end-to-end as described
-above, but actually watching a rollout attempt play out in the Kit viewport / WebRTC stream and
-grading whether the hug succeeds needs a live, watched Isaac Sim session, which this session did
-not do. Run the Stage 0-style reach check by eye before trusting this for anything beyond a code
-read - same caveat as the box-jitter feature above, and for the same reason (no way to fake
-confidence on physical behavior that was never actually watched).
+**The Isaac Sim side of `--rollout` has now been watched live, once, and it surfaced a real bug
+that's since been fixed**: the idle-pose fallback (`policy_action_vec is None`, i.e. before the
+first prediction of an attempt arrives) originally used the fully-open arm pose, which turned out
+to be close enough to the robot's raw spawn pose that the robot looked completely frozen at launch
+- there was no version of the visible ~5s settle-into-position motion teleop mode shows. Fixed by
+making the fallback match teleop's actual initial condition (`STARTING_LEFT_ARM_SWING_FRACTION`=
+0.815/`STARTING_RIGHT_ARM_SWING_FRACTION`=0.663/`STARTING_HAND_UPDOWN_RAD`=1.173-derived pose, not
+the open pose). Whether a full pick/place attempt actually succeeds end-to-end is still not
+confirmed - that first watched session ended with the policy connected and the robot correctly
+parked, but no attempt had been graded yet (see the chassis_forward addition below, which changes
+what "attempt" now means anyway).
+
+**The recorded state/action space grew from 21 to 22 dims: `chassis_forward` was added so
+forward/backward chassis motion is finally part of what gets learned, not silently dropped.**
+Motivated by a live-observed rollout failure pattern: the trained (21-dim, fixed-base) policy could
+reach and hug the box only once a human manually drove the chassis into range first, and manual
+driving mid-attempt then made the later place/release phase near table2 fail most of the time -
+because the recorder was *already* silently discarding wheel motion (`wheel_dof_indices` drives the
+wheels live every step via `compute_drive_command`/`held_keys`, but was never part of
+`state_dof_indices` or `action_vec`), so any chassis motion during a recording showed up in the
+video but not in the labels the policy trained on - a real, confirmed train/inference mismatch, not
+a modeling issue.
+
+The fix does *not* add full SLAM/navigation into the policy - per the user's own target
+architecture, SLAM (a separate, not-yet-built component) is responsible for getting the robot from
+one location to the general vicinity of the next; the policy only needs to handle the short final
+approach/retreat around the pick or place point, which is exactly what `chassis_forward` covers.
+The 22nd dim is asymmetric between state and action, unlike every other dim (where action = target
+position for the same joint state reads):
+- **State** (`forward_displacement_m`): cumulative *signed* distance (meters) the chassis has moved
+  along its own forward axis since the current attempt started (0.0 at the first recorded frame,
+  reset on every `B`-press-start and `R`-reset) - not an absolute world position, so it stays
+  meaningful regardless of where the robot happens to be parked. Computed via
+  `robot_forward_reference()`/`forward_displacement()` (new), which needed `robot_heading_yaw()` +
+  `ROBOT_FORWARD_OFFSET_RAD` ported from `stream_demo.py` (same Galbot G1 asset/root prim, same
+  -π/2 heading-vs-actual-drive-direction offset documented there) - this file never needed heading
+  before.
+- **Action** (`chassis_forward`): the forward/back drive *command* that tick (`command[0]` from
+  `compute_drive_command`, roughly `[-args.drive_speed, +args.drive_speed]`) - a velocity command,
+  not a position target, because the chassis is velocity-controlled, unlike every joint group.
+
+In `--rollout`, forward/back is now policy-controlled (`command[0]` is overridden from
+`policy_action_vec[21]` once a prediction exists) while strafe/rotate (`A`/`D`/`Q`/`E`) stay
+manual-only - they were never in the recorded action space either way, so leaving them manual
+doesn't introduce a new train/inference mismatch.
+
+**This is a breaking schema change, not an additive one**: `state_dim`/`action_dim` are now 22
+everywhere new data gets recorded, but every existing episode (`raw_episodes/`,
+`raw_episodes_cart/`) and the already-trained checkpoint
+(`act_training/table_to_table2/checkpoints/*`) are 21-dim. They cannot be mixed with new
+recordings, and the existing checkpoint cannot be queried with a 22-dim state (the normalizer's
+input layer is shape-locked to 21 - expect a loud shape-mismatch crash, not silent misbehavior, if
+you try). New data must be collected from scratch and a new checkpoint trained before `--rollout`
+works again.
+
+**Two-policy plan, not one continuous pick-to-place trajectory**: per the user's target inference
+architecture (SLAM between locations, one short fixed-base policy at each end), `pickup` and
+`place` should be recorded as **separate, independently-labeled episodes**, not as one long session
+like the original 21-dim data was. No new scene-setup code was needed for this - `--task` already
+accepts any free-form string (e.g. `--task pickup_policy` for one session, `--task place_policy`
+for another), and a "place" episode's "already holding the box" starting condition is achieved the
+same way every episode's starting condition always has been: the operator manually jogs the robot
+into the hug pose *before* pressing `B`, exactly like the existing Stage 0 workflow's "jog into
+position, then start recording." Pickup episodes should end once the box is lifted and the robot
+has backed away (not continue into a full carry-to-destination, which is what all existing episodes
+did) - end each episode at the point where SLAM would take over, per the plan above.

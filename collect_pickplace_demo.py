@@ -521,6 +521,37 @@ def compute_drive_command(held_keys: set, drive_speed: float, turn_speed: float)
     return command
 
 
+def robot_heading_yaw(orientation_wxyz: np.ndarray) -> float:
+    """Yaw (rotation about Z, radians) of the articulation root's local +X axis in world space -
+    ported as-is from stream_demo.py (same Galbot G1 asset/root prim). This is NOT the direction
+    the robot actually drives - see ROBOT_FORWARD_OFFSET_RAD."""
+    w, x, y, z = orientation_wxyz
+    return float(np.arctan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z)))
+
+
+# Same -pi/2 offset as stream_demo.py's ROBOT_FORWARD_OFFSET_RAD (confirmed there empirically:
+# robot_heading_yaw() reads 90deg ahead of the direction command=[1,0,0] actually drives) - same
+# asset/root prim, so it applies here too. Only needed here for the chassis_forward state dim (see
+# state_names below); nothing else in this file previously needed heading.
+ROBOT_FORWARD_OFFSET_RAD = np.pi / 2.0
+
+
+def robot_forward_reference(robot: SingleArticulation) -> tuple:
+    """(position_xy, forward_unit_vector) for the chassis_forward state dim - call once at the
+    start of a recording attempt (B-press or R-reset) to capture the reference frame that
+    forward_displacement_m gets measured against for the rest of that attempt."""
+    position, orientation_wxyz = robot.get_world_pose()
+    heading = robot_heading_yaw(orientation_wxyz) - ROBOT_FORWARD_OFFSET_RAD
+    return np.array(position[:2]), np.array([np.cos(heading), np.sin(heading)])
+
+
+def forward_displacement(robot: SingleArticulation, start_pos_xy: np.ndarray, forward_dir: np.ndarray) -> float:
+    """Signed distance (meters) the chassis has moved along forward_dir since start_pos_xy -
+    see state_names' chassis_forward note above."""
+    position, _ = robot.get_world_pose()
+    return float(np.dot(np.array(position[:2]) - start_pos_xy, forward_dir))
+
+
 # Arm/hand/torso jog controls - ported as-is from stream_demo.py / ../Robot_project/
 # capture_cube_rgbd.py (same asset, same joints); see stream_demo.py's module docstring and the
 # comments above each of these constants there for the full derivation.
@@ -1168,7 +1199,16 @@ def main() -> None:
         + [f"right_arm_joint{i}" for i in range(1, 8)]
         + [f"leg_joint{i}" for i in range(1, 6)]
         + ["left_gripper_joint", "right_gripper_joint"]
+        + ["chassis_forward"]
     )
+    # chassis_forward is not a joint - it's the 22nd (last) dim, appended separately from
+    # state_dof_indices below wherever state_vec/action_vec are assembled. Its STATE value is
+    # cumulative signed displacement (meters) along the chassis's own forward axis since the
+    # current recording attempt started (0.0 at the first frame, reset every B-press/R-reset) -
+    # NOT an absolute world position, so it stays meaningful/bounded regardless of where the
+    # robot happens to be parked. Its ACTION value is the forward/back drive command that tick
+    # (command[0] from compute_drive_command, roughly [-args.drive_speed, +args.drive_speed]) -
+    # a velocity command, not a position target, unlike every other action dim; see CLAUDE.md.
 
     recorder = EpisodeRecorder(
         out_dir=args.out,
@@ -1192,6 +1232,11 @@ def main() -> None:
     # doesn't fall back to teleop silently.
     policy_client = None
     policy_action_vec = None  # last action received from the server; None until the first predict
+    # chassis_forward reference frame (see state_names above) - (position, forward unit vector) at
+    # the start of the current recording attempt, set on every B-press-start and R-reset. None
+    # while IDLE; forward_displacement_m is 0.0 until this is set.
+    episode_start_pos_xy = None
+    episode_forward_dir = None
     if args.rollout:
         policy_client = PolicyClient(args.policy_host, args.policy_port)
         policy_client.connect()
@@ -1319,6 +1364,8 @@ def main() -> None:
             hand_updown_rad = STARTING_HAND_UPDOWN_RAD
             gripper_rad = 0.0
             record_accum = 0.0
+            episode_start_pos_xy = None
+            episode_forward_dir = None
             if args.rollout:
                 policy_action_vec = None
             continue
@@ -1329,6 +1376,7 @@ def main() -> None:
                 recorder.start()
                 recorder_state = RecorderState.RECORDING
                 record_accum = 0.0
+                episode_start_pos_xy, episode_forward_dir = robot_forward_reference(robot)
                 if args.rollout:
                     policy_client.reset()
                     policy_action_vec = None
@@ -1368,6 +1416,12 @@ def main() -> None:
         )
 
         command = compute_drive_command(held_keys, args.drive_speed, args.turn_speed)
+        if args.rollout and policy_action_vec is not None:
+            # Forward/back is policy-controlled during a rollout attempt (see chassis_forward in
+            # state_names) - strafe/rotate (A/D/Q/E) stay manual, they were never part of the
+            # recorded action space either way, so overriding only index 0 doesn't introduce a
+            # train/inference mismatch there.
+            command[0] = float(policy_action_vec[21])
         action = drive_controller.forward(command)
         robot.apply_action(ArticulationAction(joint_velocities=action.joint_velocities, joint_indices=wheel_dof_indices))
 
@@ -1482,7 +1536,10 @@ def main() -> None:
         record_accum += physics_dt
         if recorder_state is RecorderState.RECORDING and record_accum >= record_period:
             record_accum -= record_period
-            state_vec = robot.get_joint_positions()[state_dof_indices].astype(np.float32)
+            chassis_forward_state = forward_displacement(robot, episode_start_pos_xy, episode_forward_dir)
+            state_vec = np.concatenate(
+                [robot.get_joint_positions()[state_dof_indices], [chassis_forward_state]]
+            ).astype(np.float32)
             if args.rollout and rgba is not None:
                 # Query at the same record_fps cadence the policy was trained at. This is the
                 # observation-to-action edge of the loop: the frame/state captured just above
@@ -1491,9 +1548,9 @@ def main() -> None:
                 # different in kind from any real inference pipeline's latency).
                 policy_action_vec = policy_client.predict(rgba[:, :, :3], state_vec, args.task)
             if rgba is not None and depth is not None:
-                action_vec = np.concatenate([left_arm_q, right_arm_q, torso_q, left_gripper_q, right_gripper_q]).astype(
-                    np.float32
-                )
+                action_vec = np.concatenate(
+                    [left_arm_q, right_arm_q, torso_q, left_gripper_q, right_gripper_q, [command[0]]]
+                ).astype(np.float32)
                 recorder.append(rgba, depth, state_vec, action_vec)
 
     if policy_client is not None:
