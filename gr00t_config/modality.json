@@ -1,0 +1,64 @@
+{
+    "state": {
+        "left_arm": {
+            "start": 0,
+            "end": 7
+        },
+        "right_arm": {
+            "start": 7,
+            "end": 14
+        },
+        "torso": {
+            "start": 14,
+            "end": 19
+        },
+        "left_gripper": {
+            "start": 19,
+            "end": 20
+        },
+        "right_gripper": {
+            "start": 20,
+            "end": 21
+        },
+        "chassis_forward": {
+            "start": 21,
+            "end": 22
+        }
+    },
+    "action": {
+        "left_arm": {
+            "start": 0,
+            "end": 7
+        },
+        "right_arm": {
+            "start": 7,
+            "end": 14
+        },
+        "torso": {
+            "start": 14,
+            "end": 19
+        },
+        "left_gripper": {
+            "start": 19,
+            "end": 20
+        },
+        "right_gripper": {
+            "start": 20,
+            "end": 21
+        },
+        "chassis_forward": {
+            "start": 21,
+            "end": 22
+        }
+    },
+    "video": {
+        "head_camera": {
+            "original_key": "observation.images.head_camera"
+        }
+    },
+    "annotation": {
+        "human.task_description": {
+            "original_key": "task_index"
+        }
+    }
+}

@@ -551,3 +551,77 @@ into the hug pose *before* pressing `B`, exactly like the existing Stage 0 workf
 position, then start recording." Pickup episodes should end once the box is lifted and the robot
 has backed away (not continue into a full carry-to-destination, which is what all existing episodes
 did) - end each episode at the point where SLAM would take over, per the plan above.
+
+## GR00T conversion (for training on a bigger GPU, e.g. the user's H200)
+
+ACT is what trains and evaluates on this machine (12GB laptop GPU); NVIDIA's Isaac GR00T N1.7
+(`/home/kholis/Isaac-GR00T-main`, a sibling repo, not part of this one) is a ~3B-parameter VLA that
+needs 40GB+ VRAM even for its lightweight default fine-tune mode - out of reach locally, but well
+within a single H200. This section is about *preparing the data* for that, done entirely on this
+machine (no GPU needed for conversion) - actually fine-tuning GR00T still has to happen on the H200.
+
+**GR00T needs LeRobot v2, not v3** - our datasets (`lerobot_dataset_pickup`/`lerobot_dataset_place`,
+built by `convert_to_lerobot.py`) are v3.0. GR00T ships `scripts/lerobot_conversion/convert_v3_to_v2.py`
+for this, but it needs a *specific pinned* `lerobot` git commit in its own isolated env (not our
+`lerobot` conda env's pip-installed 0.4.x, which would conflict) - installed into a new `gr00t_convert`
+conda env (python 3.10; the subproject requires `<3.12`, and system Python here is 3.12) via
+`cd scripts/lerobot_conversion && pip install -e .` per that directory's own README. Also needed
+`conda install -c conda-forge ffmpeg` in that env too - same missing-ffmpeg-binary issue as the
+`lerobot` env earlier, except this one shells out to the `ffmpeg` binary directly via `subprocess.run`
+rather than through a Python video-decode library, so the fix is the same but the failure mode looks
+different (a `FileNotFoundError: ffmpeg`, not a decode crash).
+
+**One conversion gotcha, confirmed live**: `convert_v3_to_v2.py --root <path> --repo-id <repo_id>`
+does *not* use `<path>` as the dataset location directly - it resolves to `Path(root) / repo_id`
+internally. Our `convert_to_lerobot.py` writes flat (`--root ./lerobot_dataset_pickup` *is* the
+dataset root), so passing that straight through made the script look for a nonexistent
+`lerobot_dataset_pickup/local/pickup_policy` and silently fall through to attempting a Hub download
+(which then 401'd, since `local/pickup_policy` isn't a real Hub repo). Fixed by copying (not
+symlinking - the script does in-place move/rename, risky with symlinks) both datasets into the
+structure the flag actually expects: `gr00t_datasets/local/{pickup_policy,place_policy}/`, then
+`--root ./gr00t_datasets`. Converted in place: the v3.0 original gets renamed to a `_v3.0` suffix
+(kept, not deleted) and the new v2.1 version takes the original path.
+
+**`meta/modality.json` (GR00T's one real schema addition over plain LeRobot v2)** was hand-authored
+once (`gr00t_config/modality.json`, copied identically into both converted datasets - same robot,
+same 22-dim layout, only the recorded behavior differs) since the converter doesn't generate one.
+Maps directly onto our existing `state_names` breakdown: `left_arm` [0:7], `right_arm` [7:14],
+`torso` [14:19], `left_gripper` [19:20], `right_gripper` [20:21], `chassis_forward` [21:22], video
+`head_camera` -> `observation.images.head_camera`, and language sourced straight from the
+`task_index` column `convert_to_lerobot.py` already writes (no extra annotation work needed).
+
+**`gr00t_config/galbot_g1_config.py`** (modeled on their `examples/SO100/so100_config.py`) is the
+Python modality config GR00T's fine-tuning script actually reads - registers under
+`EmbodimentTag.NEW_EMBODIMENT` (checked: GR00T does have a pretrained `REAL_G1` tag, but that's
+almost certainly Unitree's G1 humanoid, not our Galbot G1 - a naming coincidence, not a shortcut;
+verify before ever assuming otherwise). Arm/torso/gripper actions are marked
+`ActionRepresentation.ABSOLUTE` - not a stylistic choice like SO-100's `RELATIVE` pick for its arm,
+but because that's literally what we recorded: the post-`clamp_to_actual` target position sent to
+the joint controller each tick, not a delta. `chassis_forward` doesn't fit this taxonomy cleanly at
+all - it's a recorded drive *velocity* command, not a position target in any representation - marked
+`ABSOLUTE`/`NON_EEF` as the closest approximation; **unverified** whether GR00T's normalization/
+diffusion head handles a velocity-typed channel labeled `ABSOLUTE` sensibly, worth specifically
+checking that dimension in `open_loop_eval.py`'s per-dimension plots once fine-tuned.
+
+**Verified structurally (parquet columns, video paths, task labels), not yet end-to-end** - loading
+through GR00T's own dataset class needs the full `gr00t` package (`uv sync` in the repo root, heavy:
+torch/diffusers/etc.), which wasn't installed here since actual fine-tuning happens on the H200
+machine, not this one. Confirmed directly instead: both `data/chunk-000/episode_*.parquet` files
+have 22-element `observation.state`/`action` arrays, `videos/chunk-000/observation.images.head_camera/
+episode_*.mp4` files exist matching `modality.json`'s `original_key`, and `meta/tasks.jsonl` has the
+right task string per dataset. Run GR00T's own loader on the H200 as the real first test before
+trusting this further.
+
+**To move to the H200**: copy `gr00t_datasets/local/{pickup_policy,place_policy}/` (327MB total,
+`_v3.0` backups included) and `gr00t_config/galbot_g1_config.py` over, `uv sync --all-extras` in
+the GR00T repo there, then per policy:
+```
+CUDA_VISIBLE_DEVICES=0 uv run python gr00t/experiment/launch_finetune.py \
+    --base-model-path nvidia/GR00T-N1.7-3B \
+    --dataset-path <path>/pickup_policy \
+    --embodiment-tag NEW_EMBODIMENT \
+    --modality-config-path <path>/galbot_g1_config.py \
+    --num-gpus 1 --output-dir <out>/pickup_policy \
+    --save-steps 2000 --max-steps 2000 --global-batch-size 32
+```
+(swap `pickup_policy` for `place_policy` for the other one - two separate fine-tunes, same as ACT).

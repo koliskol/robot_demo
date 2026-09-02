@@ -5,5 +5,10 @@ captures/*
 raw_episodes/
 raw_episodes_cart/
 raw_pickup/
+raw_place/
 lerobot_dataset/
+lerobot_dataset_pickup/
+lerobot_dataset_place/
+gr00t_datasets/
 act_training/
+rollout_episodes/
