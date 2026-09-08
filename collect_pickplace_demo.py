@@ -1125,18 +1125,33 @@ def spawn_real_box(
 #
 # Sized up from the original (0.45, 0.225)/0.05 wheel radius/4.4kg per request: bigger deck
 # footprint, taller undercarriage (bigger wheel radius raises deck_bottom_z - see
-# pushcart_deck_top_z), and much heavier chassis so an accidental touch during the hug doesn't
-# send it rolling. UNVERIFIED LIVE - re-run the Stage 0 reach/hug cycle and re-check
+# pushcart_deck_top_z). UNVERIFIED LIVE - re-run the Stage 0 reach/hug cycle and re-check
 # --deck-riser/ROBOT_APPROACH_GAP_M/CART_TABLE_GAP_M against the new taller/bigger geometry before
 # trusting it for real collection.
 PUSHCART_DECK_HALF_EXTENT = (0.55, 0.30)  # was (0.45, 0.225) - bigger deck footprint
 PUSHCART_DECK_THICKNESS = 0.04  # was 0.03
 PUSHCART_WHEEL_RADIUS = 0.08  # was 0.05 - raises deck_bottom_z, making the whole cart taller
 PUSHCART_HANDLE_POST_HEIGHT = 0.85  # was 0.75
-PUSHCART_CHASSIS_MASS = 25.0  # was 4.4kg - heavy enough to resist an accidental bump
+
+# Mass and rolling friction were originally both raised together (4.4kg->25kg chassis, intended to
+# resist an accidental touch) but that conflated two different things: chassis MASS also
+# determines how much reaction force gets transmitted back through a gripped handle into the
+# robot's wrist during a deliberate push, and 25kg turned out to be enough to overpower the
+# wrist's safety-limited holding force (ARM_CONTACT_MAX_LEAD_RAD) under real load - live-observed
+# as arm_joint5 creeping/oscillating well off its held target while pushing the cart (see git
+# history / session notes for the watchdog log that showed this). Splitting the two concerns
+# instead: chassis mass brought back down close to the original (inertia/reaction-force budget
+# stays small enough for the wrist to hold against), while CASTER_ROLLING_FRICTION_NM is raised
+# steeply instead (resists a light accidental bump via static friction at the wheels themselves,
+# independent of mass - a real push should still have enough sustained force to overcome it).
+# UNVERIFIED LIVE - re-test both "accidentally bump it while parking" and "deliberately grip and
+# push it" before trusting this balance; raise CASTER_ROLLING_FRICTION_NM further if light bumps
+# still move it, or lower PUSHCART_CHASSIS_MASS further if the wrist still struggles under a
+# deliberate push.
+PUSHCART_CHASSIS_MASS = 6.0  # was 25.0 (originally 4.4) - see comment above
 PUSHCART_FORK_MASS = 0.08  # was 0.05
 PUSHCART_WHEEL_MASS = 0.2  # was 0.1 - bigger sphere wheels (see Wheel{i} below)
-CASTER_ROLLING_FRICTION_NM = 0.05
+CASTER_ROLLING_FRICTION_NM = 2.0  # was 0.05 - see comment above
 
 # Which side of the deck (in the cart's own local +/-X) the handle sits on - the caster/deck
 # layout is otherwise symmetric under a 180deg yaw about Z, so "rotate the cart to the opposite
