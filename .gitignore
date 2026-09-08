@@ -8,6 +8,7 @@ raw_pickup/
 raw_place/
 lerobot_dataset/
 lerobot_dataset_pickup/
+lerobot_dataset_pickup_v1_50ep/
 lerobot_dataset_place/
 gr00t_datasets/
 act_training/
