@@ -552,6 +552,99 @@ position, then start recording." Pickup episodes should end once the box is lift
 has backed away (not continue into a full carry-to-destination, which is what all existing episodes
 did) - end each episode at the point where SLAM would take over, per the plan above.
 
+**A third task variant is being developed: grabbing/releasing the pushcart handle itself** (as
+opposed to picking a box up off it), motivated by wanting the robot able to move the cart, not just
+place things on it. This surfaced a real, still-only-partially-solved instability: gripping the
+handle and then rotating the chassis (`Q`/`E`) can visibly fling the arm apart, confirmed live to
+be a genuine physics divergence, not a rendering glitch - the console showed real `[watchdog]`
+joint-velocity spikes (`left_arm_joint5` recorded at -34.7 rad/s in one case) followed by an
+`Invalid PhysX transform` error across the *entire* robot body, meaning the physics solver's
+position/rotation math went to NaN, not just "a big but valid" value. Straight pushing (`W`) with
+the same grip is fine - only rotation triggers it.
+
+**Root cause, confirmed through live testing rather than assumed**: rotating the whole chassis
+while rigidly gripping a fixed external point forces the wrist to sweep through more range than it
+physically has to keep the hand roughly stationary - `left_arm_joint6` only has about `-42/+47deg`
+of travel (confirmed from the live asset's own authored PhysX joint limits, not the offline
+reference URDF, via a `dump_arm_joint_limits()` diagnostic added specifically to check this - the
+live asset's limits matched the reference URDF exactly once converted from degrees to radians, so
+"missing/unenforced limits" was ruled out, not confirmed). Once the required wrist travel exceeds
+what's available, the joint gets wrenched hard enough to overpower even the arm's very strong
+native PhysX drive (600000 stiffness / 60000 damping, confirmed live - an earlier attempt to fix
+this by further *raising* wrist joint stiffness was based on a wrong assumption that these joints
+were weakly driven, like the head joints were; it wasn't, and that change made a later test
+noticeably worse, consistent with over-stiffening feeding a growing oscillation rather than
+damping one - reverted, function kept but disabled). Every mitigation tried so far reduces
+frequency but does not guarantee prevention, since this is a genuine kinematic mismatch between
+the task and the wrist's range, not a tuning error:
+
+- **`JOINT_EFFORT_LIMIT_NM`** (15.0, a reasoned guess bracketing observed clean-vs-danger effort
+  values, not measured) drives a new compliance mechanism: once a joint's measured effort (read
+  via `get_measured_joint_efforts()`, same API the watchdog already used) exceeds this, further
+  motion *into* the load is blocked for that joint - forward-only for arm swing (`joint2`, retreat
+  via `O` always still works), both directions for elbow/wrist-rotate (no assumed safe direction).
+  Confirmed live to let several smaller overload events recover cleanly that would previously have
+  needed to; did not prevent the one large single-spike escalation in the same test.
+- **`--turn-speed` default lowered 0.15 -> 0.08** - slower chassis rotation gives the wrist more
+  time to track the changing geometry per unit of motion.
+- **Gripper stability fixes, unrelated to the wrist issue above but found along the way**: fixed a
+  real bug where releasing `M`/`N` didn't stop the gripper from continuing to close - the software
+  target (`gripper_rad`) accumulated at `GRIPPER_SPEED_RAD_S` (2.5 rad/s) while held, far faster
+  than the lead-clamped joint could physically follow (~0.5 rad/s), so it could race far ahead of
+  the real position; release now re-syncs it to the actual position every step instead of letting
+  it drift. Also found `GRIPPER_MAX_LEAD_RAD` at a temporarily-raised 0.02 (sped up on request)
+  reproduced finger-juddering (repeated exact `+-0.5 rad/s` readings, a stick-slip pattern against
+  handle contact) that fed into the same class of arm fling - reverted to the original 0.008.
+  Separately, `stiffen_gripper_friction()` (added to help the pinch hold better without needing
+  more closing force, which is unsafe) had silently never worked - the keyword match found zero
+  collision prims (confirmed live). A new `dump_gripper_hierarchy()` diagnostic found the gripper's
+  actual internal link names (`gripper_{l,r}_finger_link`, `gripper_{l,r}_knuckle_link`,
+  `gripper_{l,r}_inner_knuckle_link`, each with their own `visuals`/`collisions` children) by
+  reading the drive joint's own `body0`/`body1` targets rather than guessing - `HasAPI(UsdPhysics.
+  CollisionAPI)` reads `False` on literally every prim in the hand assembly for reasons not
+  understood, so the fix targets these real names directly instead of filtering on that check.
+
+**A promising alternative grip approach was found live, not yet implemented as a policy**: rotating
+both wrists (see the wrist-rotate controls below) can orient the hands so the handle is squeezed
+between both open palms from either side, instead of pinched by the fingers closing - the same
+bimanual-compression principle as the box hug, applied to the handle. This avoids the gripper's
+closing mechanism (the actual fragile part in every test above) entirely. Plan is to record this as
+two more independent policies (`grab_cart_policy`/`release_cart_policy`), same pattern as
+`pickup_policy`/`place_policy` - not yet attempted live for whether it's actually more stable under
+chassis rotation, which is the real test given the root cause above.
+
+**Manual wrist-rotate controls** (`C`/`V`, `,`/`.`, `[`/`]`) jog `joint5`/`joint6`/`joint7`
+independently - added specifically to fix the gripper's resting angle (it sat diagonal, not flat,
+at the asset's authored zero position) and now also used to explore the open-palm grip above. Each
+joint's mapping to a local axis of the gripper end link (`left`/`right_arm_link7`) was derived by
+composing the URDF's origin rotations, not guessed - `joint7`'s own `<axis>` **is** link7's local Z
+by definition (its child prim is link7 itself); `joint6`'s and `joint5`'s axes were derived by
+composing joint7's and joint6's fixed mounting rotations respectively, landing on link7's local Y
+and negative X. `C`/`V` (X/joint5) is confirmed live as the correct rotation to fix the diagonal
+resting angle, calibrated to `-0.7400 rad` (`-42.4deg`) against a user-supplied reference photo and
+set as the default (`STARTING_WRIST_X_RAD`) so no key press is needed for that fix specifically;
+`Y`/`Z` have no live-calibrated default yet (both `0`). Two earlier guesses on `joint7` alone
+(`+45deg` then `-45deg`, before this per-axis, per-key setup existed) were tried and confirmed
+wrong first - worth remembering before assuming a similar rotation fix will work on the first try
+elsewhere in this file.
+
+**Pushcart size/mass/friction were re-tuned multiple times this session, ending in a deliberately
+split design**: originally sized up together (chassis mass `4.4kg -> 25kg`, meant to resist an
+accidental bump) but that conflated two different things - mass also determines how much reaction
+force a deliberate push/grip transmits back into the wrist, and 25kg turned out to be enough to
+contribute to the fling issue above (confirmed via the watchdog before the chassis-rotation root
+cause was isolated). Split apart instead: chassis mass brought back down to `6kg` (close to
+original, keeps the wrist's reaction-force budget small), while `CASTER_ROLLING_FRICTION_NM` was
+raised steeply instead (`0.05 -> 2.0`) to resist a light accidental bump via wheel friction,
+independent of mass - a real sustained push should still overcome it. Also this session: the
+handle was moved to the deck's opposite side (`PUSHCART_HANDLE_SIDE_SIGN`, a sign flip exploiting
+the caster/deck layout's symmetry rather than an authored rotation), the deck/wheels sized up
+(`(0.45, 0.225)/0.05 wheel radius -> (0.55, 0.30)/0.08`), and the wheels changed from flat
+`Cylinder` prims to `Sphere` prims (a cylinder only looks right spinning about its own axis; the
+casters' swivel+spin joints were already unlimited/360deg-free, the cylinder shape was just what
+looked wrong from an arbitrary fork heading). None of this is live-verified beyond what's noted
+above - re-run the Stage 0 reach/hug cycle against the new geometry before trusting it fully.
+
 ## GR00T conversion (for training on a bigger GPU, e.g. the user's H200)
 
 ACT is what trains and evaluates on this machine (12GB laptop GPU); NVIDIA's Isaac GR00T N1.7

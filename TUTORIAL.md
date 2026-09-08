@@ -82,6 +82,7 @@ Things to check, and what to do if they fail:
 | A dark shape fills most of the frame during a deep crouch + arm swing | A separate issue from the one above: that's the robot's own torso/shoulder self-occluding the head-mounted camera, not a bug - confirmed live via a controlled pose test. Tilting down further makes it worse, not better. Try less torso crouch (partial `I`/`K`), relying more on elbow lift (`J`/`L`) to keep the torso out of the camera's view - a teleop-technique fix, not something tunable via constants. |
 | Camera view looks tilted sideways, not just down | Not the mount's roll/tilt math (verified correct via static rendering) - the head's own pan/tilt joints ship with very weak drive and, until fixed, nothing commanded them. During active torso/arm motion the head could wobble up to ~36° in an uncontrolled direction. Now stiffened and actively held every frame (`stiffen_head_joints`/`hold_head_joints`), cutting worst-case drift to ~12° under an aggressive stress test - real teleop should see less, but some residual wobble during fast motion is still expected. See `CLAUDE.md`. |
 | Only one hand is visible mid-hug even though the robot is facing straight | Not a camera bug - confirmed live with a symmetric wide-FOV render at rest (no yaw bias) and a controlled test that reproduced a fully-converged, hands-raised hug: both grippers land centered and symmetric in frame together. The single-hand view happens when the swing (`U`) hasn't fully closed yet and/or the hands haven't been raised (`J`) - a controlled test found the two arms don't enter the camera's view at the same rate while still mid-swing (their `ARM_FORWARD_POSE` joint values aren't simple mirrors of each other), so whichever arm is further along shows up first. Hold `U` and `J` together and give it a moment to settle before judging the framing. |
+| Arm/gripper visibly flings or breaks apart while gripping something (e.g. the pushcart handle) and then rotating (`Q`/`E`) | Confirmed live to be a real physics divergence, not a rendering glitch (the console shows `[watchdog]` joint-velocity spikes and, in the worst case, an `Invalid PhysX transform` error across the whole robot). Root cause: rotating the whole chassis while rigidly gripping a fixed point forces the wrist through more range than it has (`joint6` only has ~±42-47°) - closing/holding force isn't the trigger by itself, straight pushing (`W`) is fine. Mitigations exist (effort-based compliance eases off once a joint is overloaded, `--turn-speed` defaults lower, gripper friction/lead tuned for stability) but don't guarantee prevention. **Workaround: don't rotate while gripping** - release first if you need to turn, then re-grip once repositioned. |
 
 The boxes are real cardboard-box props from Isaac's warehouse/logistics asset set (generic
 shipping boxes, not branded items) — plain colored cubes were dropped entirely. These ship as
@@ -93,7 +94,9 @@ also spawn alongside the main one, for size variety — these are real pick-up t
 decoration; pass `--no-extra-boxes` for just the single box. They don't spawn on `--cube-start
 cart` or `--cube-start table2` sessions (the pushcart deck is too small to fit 3 boxes, and the
 extra boxes are only ever placed on table1's own surface) — the main box alone is small enough to
-fit the pushcart deck (confirmed: 0.38m fits within the deck's 0.6m width).
+fit the pushcart deck (0.38m fits comfortably within the deck's current 1.1m x 0.6m footprint —
+sized up from an original 0.6m width; see `CLAUDE.md` for the pushcart's full size/mass/friction
+history).
 
 The box's spawn/reset position and yaw are randomized a little each episode by default
 (`--box-jitter-m`, default 0.03m radius; `--box-yaw-jitter-deg`, default 10°) — every episode
@@ -102,6 +105,13 @@ point, which risks a policy that only ever learned one pixel-perfect box pose. T
 default; pass `0` to either flag to disable it. Console prints the sampled offset each episode.
 Keep this modest — the hug's arm pose (`ARM_FORWARD_POSE`) is tuned for one specific position, so
 if the hug stops reliably converging after widening these, narrow them back down.
+
+The box's **size** can also vary across episodes, for size generalization: `--cube-scale-min`/
+`--cube-scale-max` together enable this (off by default, still fixed at `--cube-scale` otherwise).
+Plain min/max sampling is random per episode; add `--cube-scale-cycle` to instead step
+deterministically through small → medium → big → repeat, useful for visually confirming size
+variation is actually happening (watch the console's printed `scale=...` value) rather than
+inferring it from random draws.
 
 ### Pick/place target: pushcart or a second table
 
@@ -186,6 +196,9 @@ Controls during recording:
 | `U`/`O` | swing both arms forward/back (the hug) |
 | `J`/`L` | raise/lower both hands |
 | `M`/`N` | close/open both grippers (optional) |
+| `C`/`V` | rotate both wrists on joint5 (local X) — defaults to a live-calibrated flat/level gripper pose, only needed for further adjustment |
+| `,`/`.` | rotate both wrists on joint6 (local Y) |
+| `[`/`]` | rotate both wrists on joint7 (local Z) |
 | `B` | toggle: start recording → stop and await a label |
 | `Y` | (after stop) label the episode **success** and save it |
 | `F` | (after stop) label the episode **failure** and save it |
