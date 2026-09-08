@@ -705,7 +705,18 @@ GRIPPER_KEYS = {
     carb.input.KeyboardInput.N: -1.0,  # toward open
     carb.input.KeyboardInput.M: 1.0,  # toward closed
 }
-GRIPPER_MAX_LEAD_RAD = 0.008
+# This is the actual bottleneck on how fast M/N open/close feel, not GRIPPER_SPEED_RAD_S above -
+# the joint can only track a moving target at roughly GRIPPER_MAX_LEAD_RAD/physics_dt, so at the
+# original 0.008 rad (~0.5 rad/s at 60Hz) a full open<->close stroke took ~3.4s despite
+# GRIPPER_SPEED_RAD_S allowing much faster. Raised to 0.02 (~2.5x faster, ~1.25 rad/s, full stroke
+# ~1.4s) per request - still far below the 0.3 rad this project's own sibling documented as
+# actively unsafe (arm flinging under sustained contact, e.g. gripping the pushcart handle), but
+# nothing between 0.008 and 0.3 has ever been tested live. UNVERIFIED LIVE (no Isaac Sim available
+# while writing this) - specifically re-test closing on something rigid (the pushcart handle, a
+# box) before trusting this for real use; lower it back toward 0.008 if closing on an obstacle
+# shows any sign of the same instability, rather than assuming 0.02 is automatically safe just
+# because it's smaller than the proven-bad 0.3.
+GRIPPER_MAX_LEAD_RAD = 0.02
 
 # Pushing the pushcart by its handle needs the pinch grip to transmit real push force without
 # slipping - the reported failure ("robot moves back, cart doesn't move, hand loses the grab") is
