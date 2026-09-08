@@ -34,13 +34,20 @@ stream_demo.py/../Robot_project/capture_cube_rgbd.py:
                 press N to activate the place policy (--policy2-host/--policy2-port, task=--task2).
                 Two separate policy_server.py processes must be running, one per checkpoint/port.
                 Switching resets the newly-activated policy's internal action-chunk queue.
-    C / V       hold to rotate both wrists one way / the other (joint5 - confirmed by the user as
+    C / V       hold to rotate both wrists on joint5 (link7's local X - confirmed by the user as
                 the correct rotation to fix the gripper's diagonal resting angle; see
-                WRIST_ROTATE_JOINT_INDEX's comment for the axis derivation). Now defaults to the
-                live-calibrated flat/horizontal pose (STARTING_WRIST_ROTATE_RAD = -0.7400 rad /
-                -42.4deg) at launch/reset, so C/V are only needed for further fine adjustment -
-                prints "[wrist] joint5=...deg" on release if you do.
-                In --rollout mode this is policy-controlled too, so C and V are inert there.
+                WRIST_X_JOINT_INDEX's comment). Defaults to the live-calibrated flat/horizontal
+                pose (STARTING_WRIST_X_RAD = -0.7400 rad / -42.4deg) at launch/reset, so C/V are
+                only needed for further fine adjustment - prints "[wrist] joint5=...deg" on
+                release if you do.
+    , / .       hold to rotate both wrists on joint6 (link7's local Y) - re-enabled alongside C/V
+                to try a different grab approach. No live-calibrated default yet
+                (STARTING_WRIST_Y_RAD = 0) - prints "[wrist] joint6=...deg" on release.
+    [ / ]       hold to rotate both wrists on joint7 (link7's local Z, by definition - its own
+                <axis> in the URDF IS that link's Z). No live-calibrated default yet
+                (STARTING_WRIST_Z_RAD = 0) - prints "[wrist] joint7=...deg" on release.
+                In --rollout mode all three of these are policy-controlled, so C/V/,/./[/] are
+                inert there.
     R           reset the robot/cube/cart to spawn pose (also discards any in-progress episode)
 
     B           toggle: start recording an episode / stop and await a label
@@ -280,9 +287,16 @@ parser.add_argument(
 parser.add_argument(
     "--turn-speed",
     type=float,
-    default=0.15,
+    default=0.08,
     help="Chassis rotation command magnitude. Lower than stream_demo.py's 0.3 default, same "
-    "tip-over reasoning as --drive-speed.",
+    "tip-over reasoning as --drive-speed - lowered further from an original 0.15 after live "
+    "testing showed rotating (Q/E) while gripping the pushcart handle could release/break the "
+    "grip: a fast chassis rotation swings the whole robot body around the fixed grip point, "
+    "generating a large reaction torque through the arm into the handle. A slower rotation gives "
+    "the arm's compliance/lead-clamp mechanisms (see JOINT_EFFORT_LIMIT_NM/ARM_CONTACT_MAX_LEAD_RAD) "
+    "more time to track the changing geometry instead of being wrenched. UNVERIFIED LIVE (no "
+    "Isaac Sim available while writing this) - re-test grip-then-rotate at this value; lower "
+    "further if the grip still releases, since rotation speed alone may not be the whole story.",
 )
 parser.add_argument("--arm-speed", type=float, default=0.4, help="Max arm joint speed in radians/second.")
 parser.add_argument("--torso-speed", type=float, default=0.4, help="Torso up/down speed, as a fraction/second of its full travel.")
@@ -397,22 +411,27 @@ def hold_head_joints(robot: SingleArticulation, head_dof_indices: list) -> None:
 
 def stiffen_gripper_friction(stage, robot_prim: str) -> None:
     """Bind a higher-friction PhysicsMaterial (see GRIPPER_FRICTION_COEFF's comment for why this,
-    not a stronger pinch, is the right lever) to every collision-enabled prim under the robot
-    whose path looks like a gripper/finger/knuckle part. Call once, before world.reset(), same as
-    stiffen_head_joints() above.
+    not a stronger pinch, is the right lever) to the gripper's real finger/knuckle link prims and
+    their "collisions" sub-geometry. Call once, before world.reset(), same as stiffen_head_joints()
+    above.
 
-    Discovers the actual prims by walking the live prim tree rather than a hardcoded path - unlike
-    HEAD_CAMERA_MOUNT/HEAD_JOINT_PATHS above (found once by a live prim-tree walk and then hardcoded
-    since they're stable, well-known mount points), this project has never enumerated the gripper's
-    internal link names beyond the two drive-joint DOF names (left_gripper_joint/right_gripper_
-    joint) - only the sibling project's comment describes them in general terms ("inner knuckle,
-    knuckle, finger, on both jaws"), not exact paths. Matching by keyword and printing every prim
-    bound is the safer option pending an actual live tree walk to get exact paths.
+    First version of this function matched by keyword ("gripper"/"finger"/"knuckle" as a path
+    substring) AND required prim.HasAPI(UsdPhysics.CollisionAPI) - confirmed live to match zero
+    prims. dump_gripper_hierarchy() (see above) then found the real names via the drive joint's
+    body0/body1 targets: gripper_{l,r}_finger_link, gripper_{l,r}_knuckle_link, gripper_{l,r}_
+    inner_knuckle_link, each with their own "visuals"/"collisions" sub-prims (e.g. .../gripper_l_
+    finger_link/collisions/link_3). That same dump also showed HasAPI(UsdPhysics.CollisionAPI)
+    reads False on literally every prim in the hand assembly, including ones named "collisions/
+    link_N" - i.e. that check is not a reliable collision-prim filter for this asset (collision is
+    authored some other way it doesn't detect). This version drops that check entirely and matches
+    the real link names directly instead - binding a material to a prim that turns out not to be
+    an actual collider is harmless (no effect), so casting this net is strictly safer than the
+    keyword-plus-HasAPI combination that provably missed everything.
 
     UNVERIFIED LIVE (no Isaac Sim available while writing this) - read the printed prim list on
-    launch and confirm it's actually the finger/gripper surfaces, not e.g. nothing (keyword miss)
-    or something unintended (keyword false-positive elsewhere in the robot tree), before trusting
-    the friction numbers to have any effect at all.
+    launch to confirm it's non-empty and look like the finger surfaces; there's still no live
+    confirmation the friction value itself actually changes contact behavior, since HasAPI can't
+    be used here to confirm these are real colliders ahead of time.
     """
     material = UsdShade.Material.Define(stage, "/World/GripperFrictionMaterial")
     material_api = UsdPhysics.MaterialAPI.Apply(material.GetPrim())
@@ -420,11 +439,9 @@ def stiffen_gripper_friction(stage, robot_prim: str) -> None:
     material_api.CreateDynamicFrictionAttr(GRIPPER_FRICTION_COEFF)
     material_api.CreateRestitutionAttr(0.0)
 
-    keywords = ("gripper", "finger", "knuckle")
+    keywords = ("finger_link", "knuckle_link", "/collisions/")
     bound_paths = []
     for prim in Usd.PrimRange(stage.GetPrimAtPath(robot_prim)):
-        if not prim.HasAPI(UsdPhysics.CollisionAPI):
-            continue
         path_str = str(prim.GetPath()).lower()
         if any(keyword in path_str for keyword in keywords):
             UsdShade.MaterialBindingAPI.Apply(prim).Bind(
@@ -438,7 +455,7 @@ def stiffen_gripper_friction(stage, robot_prim: str) -> None:
             print(f"    {path}")
     else:
         print(
-            "[warning] stiffen_gripper_friction matched no collision prims under "
+            "[warning] stiffen_gripper_friction matched no prims under "
             f"{robot_prim!r} for keywords {keywords} - friction material NOT applied anywhere. "
             "Check the actual gripper/finger prim names live and adjust the keyword list."
         )
@@ -451,7 +468,7 @@ def dump_arm_joint_limits(stage, robot_prim: str) -> None:
     to 14.79/7.37 rad - several full rotations past any plausible limit - which raised a real
     question this file has never actually checked: whether these joints have a PhysX rotation
     limit enforced at all in THIS asset, as opposed to the separate offline reference URDF
-    (../Robot_project/urdf/galbot_g1_*_arm.urdf) that ARM_FORWARD_POSE/WRIST_ROTATE_MIN_RAD/etc.
+    (../Robot_project/urdf/galbot_g1_*_arm.urdf) that ARM_FORWARD_POSE/WRIST_X_MIN_RAD/etc.
     were derived from - a USD asset's actual joint authoring doesn't have to match a
     separately-generated URDF just because both describe the same robot. Call once, right after
     add_reference_to_stage, before any of this file's own stiffen_*/hold_* joint modifications.
@@ -471,9 +488,53 @@ def dump_arm_joint_limits(stage, robot_prim: str) -> None:
         print(f"[joint-limits] {path_str}: lower={lower} upper={upper} stiffness={stiffness} damping={damping}")
 
 
+def dump_gripper_hierarchy(stage, robot_prim: str) -> None:
+    """One-time diagnostic dump (not a fix) - find the real prim paths of the gripper's internal
+    finger/knuckle links, straight from the live asset, since guessing them has already failed
+    once: stiffen_gripper_friction's keyword match ("gripper"/"finger"/"knuckle" as a path
+    substring) found zero collision prims, meaning this asset names those parts something else
+    entirely - this file has never actually enumerated them, only the drive joint's DOF name
+    (left_gripper_joint/right_gripper_joint, used via robot.get_dof_index()) was ever confirmed.
+
+    Finds the drive joint prim itself the same reliable way dump_arm_joint_limits found the arm
+    joints (path suffix match, not a keyword guess - a joint's own name is not in question, only
+    its surrounding links are), reads its body0/body1 targets directly (the actual two links it
+    connects), then walks and prints every descendant of the joint's parent prim - the whole hand
+    assembly - along with which ones carry CollisionAPI, so the real finger/knuckle names (and
+    which of them actually need the friction material) are known instead of guessed.
+    """
+    for side in ("left", "right"):
+        joint_name = f"{side}_gripper_joint"
+        joint_prim = None
+        for prim in Usd.PrimRange(stage.GetPrimAtPath(robot_prim)):
+            if str(prim.GetPath()).endswith(joint_name):
+                joint_prim = prim
+                break
+        if joint_prim is None:
+            print(f"[gripper-hierarchy] no prim found ending in {joint_name!r} under {robot_prim!r}")
+            continue
+
+        joint = UsdPhysics.Joint(joint_prim)
+        body0 = joint.GetBody0Rel().GetTargets() if joint else []
+        body1 = joint.GetBody1Rel().GetTargets() if joint else []
+        print(f"[gripper-hierarchy] {joint_name} prim: {joint_prim.GetPath()}")
+        print(f"[gripper-hierarchy] {joint_name} body0={body0} body1={body1}")
+
+        # joint_prim.GetParent() alone lands on the "joints" subfolder (siblings of joint_prim,
+        # all correctly collision=False, no actual link geometry there - confirmed live, this bug
+        # was in the first version of this function) - the real link/mesh tree (e.g. gripper_
+        # flange, gripper_r_knuckle_link per body0/body1 above) is one level further up, as a
+        # sibling of "joints".
+        hand_root = joint_prim.GetParent().GetParent()
+        print(f"[gripper-hierarchy] {side} hand assembly under: {hand_root.GetPath()}")
+        for prim in Usd.PrimRange(hand_root):
+            has_collision = prim.HasAPI(UsdPhysics.CollisionAPI)
+            print(f"    {prim.GetPath()}  (collision={has_collision})")
+
+
 # arm_joint5/6/7 (the wrist) are barely driven by this file's own control scheme - joint7 is
-# always commanded to 0 (nothing ever adds to that index), joint6 likewise, and joint5 (see
-# WRIST_ROTATE_JOINT_INDEX) only gets a modest fixed position target. Live-observed via the
+# always commanded to 0 (nothing ever adds to that index); joint5/6 (see WRIST_X/Y_JOINT_INDEX)
+# each only get a modest fixed position target. Live-observed via the
 # watchdog (see GRIPPER_WATCHDOG_VELOCITY_RAD_S) during a pinch-the-handle-then-move test:
 # right_arm_joint7 reached +2.2657 rad - past its own documented hard limit of +-1.5382 rad - at
 # 3.19 rad/s, and right_arm_joint5 was dragged from its -0.74 rad target out to -1.756 rad at
@@ -783,24 +844,44 @@ HAND_UPDOWN_KEYS = {
     carb.input.KeyboardInput.J: 1.0,  # toward hand up
 }
 
-GRIPPER_CLOSE_MAX_RAD = np.radians(97.57470703125)
+# 97.5747deg is this drive joint's own authored hard limit (both hands) - but live testing
+# (pinching in open air, nothing between the fingers) showed the console diagnostic climbing
+# perfectly smoothly the entire way, then simply stopping dead the instant it reached exactly this
+# value, with the robot visibly breaking (arm-flinging) at that same moment - strongly suggesting
+# the two jaws' collision meshes aren't clearanced to actually reach the joint's full authored
+# limit without overlapping each other once nothing (no real object) stops them early, and a
+# strongly-driven (600000 stiffness - see dump_arm_joint_limits) joint trying to push two
+# overlapping rigid bodies further into each other is exactly the kind of sudden large contact
+# force this project has repeatedly found causes the fling instability. GRIPPER_CLOSE_MAX_RAD_
+# RAW keeps the true joint limit on record; the 10% margin below is what's actually commanded, so
+# the fingers are never driven to their absolute mechanical end-stop with nothing between them.
+# Real grasped objects (the box, the cart handle) are far thicker than this margin and would stop
+# the fingers well before either limit is ever approached, so this shouldn't cost any real grip
+# capability. UNVERIFIED LIVE (no Isaac Sim available while writing this) - re-run the exact same
+# "pinch in open air" test and confirm it no longer breaks at full closure; tighten the margin
+# further (lower the 0.9 factor) if it still breaks, since that would mean the true overlap point
+# is even earlier than a 10% margin accounts for.
+GRIPPER_CLOSE_MAX_RAD_RAW = np.radians(97.57470703125)
+GRIPPER_CLOSE_MAX_RAD = 0.9 * GRIPPER_CLOSE_MAX_RAD_RAW
 GRIPPER_SPEED_RAD_S = 2.5
 GRIPPER_KEYS = {
     carb.input.KeyboardInput.N: -1.0,  # toward open
     carb.input.KeyboardInput.M: 1.0,  # toward closed
 }
 # This is the actual bottleneck on how fast M/N open/close feel, not GRIPPER_SPEED_RAD_S above -
-# the joint can only track a moving target at roughly GRIPPER_MAX_LEAD_RAD/physics_dt, so at the
-# original 0.008 rad (~0.5 rad/s at 60Hz) a full open<->close stroke took ~3.4s despite
-# GRIPPER_SPEED_RAD_S allowing much faster. Raised to 0.02 (~2.5x faster, ~1.25 rad/s, full stroke
-# ~1.4s) per request - still far below the 0.3 rad this project's own sibling documented as
-# actively unsafe (arm flinging under sustained contact, e.g. gripping the pushcart handle), but
-# nothing between 0.008 and 0.3 has ever been tested live. UNVERIFIED LIVE (no Isaac Sim available
-# while writing this) - specifically re-test closing on something rigid (the pushcart handle, a
-# box) before trusting this for real use; lower it back toward 0.008 if closing on an obstacle
-# shows any sign of the same instability, rather than assuming 0.02 is automatically safe just
-# because it's smaller than the proven-bad 0.3.
-GRIPPER_MAX_LEAD_RAD = 0.02
+# the joint can only track a moving target at roughly GRIPPER_MAX_LEAD_RAD/physics_dt. Was
+# temporarily raised to 0.02 (~2.5x faster) per a speed request, then REVERTED back to 0.008 -
+# live testing with 0.02 active reproduced the actual "hand breaks" failure: gripping the pushcart
+# handle and holding M made the fingers visibly judder (confirmed in the console too - both
+# gripper joints repeatedly hit an exact +-0.5 rad/s reading, a stick-slip pattern against contact
+# resistance), and that sustained juddering is what then destabilized the whole arm into a fling,
+# visibly breaking the fingers. A looser lead directly means the drive pushes harder/faster into
+# resistance each step, which is very likely what fed this oscillation - speed and stability were
+# in tension here, and this reverts back to the value already known to hold up under contact
+# (confirmed across multiple earlier tests with the same "grip the handle" scenario before the
+# lead was loosened). Do not raise this again without a live test of gripping something rigid and
+# holding it for several seconds, not just an open-air open/close check.
+GRIPPER_MAX_LEAD_RAD = 0.008
 
 # Live instability watchdog for the "hand keeps breaking when I pinch the handle and move" report -
 # no arm/gripper joint should ever move this fast during normal teleop (every jog control here is
@@ -810,6 +891,23 @@ GRIPPER_MAX_LEAD_RAD = 0.02
 # lower it if it doesn't trigger on a fling you can see happening, or raise it if normal fast
 # teleop motion false-triggers it.
 GRIPPER_WATCHDOG_VELOCITY_RAD_S = 3.0
+
+# Effort-based compliance: stop advancing a joint's target further once it's under real sustained
+# load, instead of continuing to command it forward regardless of resistance - this is a genuine
+# control-scheme gap, not an IK problem (this file never uses IK; every joint here is a fixed,
+# hand-authored position target, none of them aware of contact force). clamp_to_actual already
+# bounds how far the target can outrun the actual position each step, which prevents instant force
+# spikes, but does nothing to stop a joint being slowly dragged off-target by a sustained push -
+# exactly the mechanism behind every fling traced in this file's history (e.g. left_arm_joint5
+# recorded at -66.2Nm/-75.1Nm during two separate pinch-and-push tests, vs. under ~0.2Nm during
+# all-clear free motion in every clean log). 15.0 sits well above that free-motion noise floor but
+# below the observed danger-zone efforts - a reasoned choice, not measured against a controlled
+# sweep. Only gates the arm's actively-driven joints (swing/joint2, hand-updown/joint4, wrist-
+# rotate/joint5) - the gripper's own drive joint's effort stayed under 0.01Nm even while visibly
+# juddering in every log, so effort isn't a useful signal there; that judder looks to be a
+# velocity-limit phenomenon, not a force one, and needs a different fix if it turns out to matter
+# on its own.
+JOINT_EFFORT_LIMIT_NM = 15.0
 
 # How often to print the gripper-specific diagnostic (target vs. actual vs. velocity vs. effort)
 # while M/N is held or the gripper is off its target - see the print site below, added
@@ -832,21 +930,41 @@ GRIPPER_DIAG_PERIOD_S = 0.2
 # static friction is roughly 1.0-1.5) - not measured against this specific asset's fingertip mesh.
 GRIPPER_FRICTION_COEFF = 1.2
 
-# C/V jog joint5 to reorient the gripper - confirmed live by the user as the correct rotation
-# (out of three candidates tried: joint5/6/7, one per local axis of the gripper end link
-# left/right_arm_link7 - see git history for the X/Y/Z derivation and the two earlier wrong
-# guesses on joint7 before this per-axis testing setup existed). joint5's own axis lands on link7's
-# local NEGATIVE X (derived by composing joint5/6/7's origin rpy chain from the URDF, not guessed).
-# Hard limit is joint5's own from the URDF, not estimated. Sign is applied identically to both
-# arms - only an assumption (same as HAND_UPDOWN_KEYS makes for joint4), not derived the way it was
-# for the ruled-out Y candidate - flip WRIST_ROTATE_KEYS' sign for one arm specifically if only one
-# hand rotates backward.
-WRIST_ROTATE_JOINT_INDEX = 4  # joint5, 0-indexed into the 7-joint [joint1..joint7] chain
-WRIST_ROTATE_MIN_RAD = -2.91697
-WRIST_ROTATE_MAX_RAD = 2.91697
-WRIST_ROTATE_KEYS = {
+# C/V jog joint5, ,/. jog joint6 - two independent wrist reorientation controls, re-enabled
+# together per request to experiment with a different grab approach. joint5 (C/V) is confirmed
+# live by the user as the correct rotation for the flat/horizontal gripper fix; joint6 (,/.) is
+# the other live-tested candidate from that same X/Y/Z investigation (see git history for the
+# full derivation and the two wrong guesses on joint7 before this per-axis setup existed).
+# joint5's own axis lands on link7's local NEGATIVE X; joint6's lands on link7's local Y (both
+# derived by composing joint5/6/7's origin rpy chain from the URDF, not guessed) - i.e. C/V = X,
+# ,/. = Y (easy to misremember since it's the opposite of the more common X-then-Y reading order).
+# Hard limits are each joint's own from the URDF, not estimated. Sign is applied identically to
+# both arms for both - confirmed by composing both arms' axis-sign differences for Y (joint6's
+# axis and joint7's mount sign both flip between arms and cancel); only an assumption for X, not
+# derived - flip a given axis's KEYS dict sign for one arm specifically if only one hand rotates
+# backward.
+WRIST_X_JOINT_INDEX = 4  # joint5, 0-indexed into the 7-joint [joint1..joint7] chain
+WRIST_X_MIN_RAD = -2.91697
+WRIST_X_MAX_RAD = 2.91697
+WRIST_X_KEYS = {
     carb.input.KeyboardInput.C: -1.0,
     carb.input.KeyboardInput.V: 1.0,
+}
+
+WRIST_Y_JOINT_INDEX = 5  # joint6
+WRIST_Y_MIN_RAD = -0.7354
+WRIST_Y_MAX_RAD = 0.8227
+WRIST_Y_KEYS = {
+    carb.input.KeyboardInput.COMMA: -1.0,
+    carb.input.KeyboardInput.PERIOD: 1.0,
+}
+
+WRIST_Z_JOINT_INDEX = 6  # joint7 - its own <axis> IS link7's local Z, exactly, by definition
+WRIST_Z_MIN_RAD = -1.5382
+WRIST_Z_MAX_RAD = 1.5382
+WRIST_Z_KEYS = {
+    carb.input.KeyboardInput.LEFT_BRACKET: -1.0,
+    carb.input.KeyboardInput.RIGHT_BRACKET: 1.0,
 }
 
 TORSO_UP_POSE = [0.0, 0.0, 0.0, 0.0, 0.0]
@@ -888,11 +1006,16 @@ STARTING_LEFT_ARM_SWING_FRACTION = 0.815
 STARTING_RIGHT_ARM_SWING_FRACTION = 0.663
 STARTING_HAND_UPDOWN_RAD = 1.173
 
-# Default wrist-rotate value (see WRIST_ROTATE_JOINT_INDEX above), applied at launch/reset.
-# Live-calibrated by the user via C/V and the console's "[wrist] joint5=...deg" readout -
+# Default wrist-rotate values (see WRIST_X/Y/Z_JOINT_INDEX above), applied at launch/reset.
+# X (joint5) is live-calibrated via C/V and the console's "[wrist] joint5=...deg" readout -
 # -0.7400 rad (-42.4deg) is where the gripper actually reads flat/horizontal against the
-# reference photo, confirmed live, not guessed.
-STARTING_WRIST_ROTATE_RAD = -0.7400
+# reference photo, confirmed live, not guessed. Y (joint6) and Z (joint7) have no live-calibrated
+# value yet - left at 0/no-offset; hold , / . or [ / ] and watch the matching "[wrist] jointN=...
+# deg" readout the same way if a non-zero default turns out to help the new grab approach being
+# tried.
+STARTING_WRIST_X_RAD = -0.7400
+STARTING_WRIST_Y_RAD = 0.0
+STARTING_WRIST_Z_RAD = 0.0
 
 MAX_JOINT_LEAD_RAD = 0.3
 # Tighter than stream_demo.py/capture_cube_rgbd.py's 0.1 rad - live-observed here (holding U
@@ -1430,6 +1553,7 @@ def main() -> None:
 
     add_reference_to_stage(usd_path=assets_root_path + ROBOT_ASSET, prim_path=ROBOT_PRIM)
     dump_arm_joint_limits(stage, ROBOT_PRIM)
+    dump_gripper_hierarchy(stage, ROBOT_PRIM)
     stiffen_head_joints()
     stiffen_gripper_friction(stage, ROBOT_PRIM)
     # stiffen_wrist_joints(stage, ROBOT_PRIM) - DISABLED per live evidence, not just left
@@ -1563,6 +1687,7 @@ def main() -> None:
         + [f"right_arm_joint{i}" for i in range(1, 8)]
     )
     watchdog_dof_indices = left_gripper_dof_indices + right_gripper_dof_indices + left_arm_dof_indices + right_arm_dof_indices
+    watchdog_index_by_name = {name: i for i, name in enumerate(watchdog_names)}
 
     state_dof_indices = np.array(
         left_arm_dof_indices + right_arm_dof_indices + leg_indices + left_gripper_dof_indices + right_gripper_dof_indices
@@ -1628,7 +1753,9 @@ def main() -> None:
     torso_height_fraction = 0.0
     hand_updown_rad = STARTING_HAND_UPDOWN_RAD
     gripper_rad = 0.0
-    wrist_rotate_rad = STARTING_WRIST_ROTATE_RAD
+    wrist_x_rad = STARTING_WRIST_X_RAD
+    wrist_y_rad = STARTING_WRIST_Y_RAD
+    wrist_z_rad = STARTING_WRIST_Z_RAD
 
     # Live viewing only (see module docstring) - not the recorder, which samples separately at a
     # fixed rate below. No depth/lidar here, so the browser page's depth/map/point-cloud panels
@@ -1645,12 +1772,14 @@ def main() -> None:
     label_fail_requested = False
     discard_requested = False
     camera_print_requested = False
-    wrist_print_requested = False
+    wrist_x_print_requested = False
+    wrist_y_print_requested = False
+    wrist_z_print_requested = False
     activate_pickup_requested = False
     activate_place_requested = False
 
     def on_keyboard_event(event, *_args, **_kwargs) -> bool:
-        nonlocal reset_requested, record_requested, label_success_requested, label_fail_requested, discard_requested, camera_print_requested, wrist_print_requested, activate_pickup_requested, activate_place_requested
+        nonlocal reset_requested, record_requested, label_success_requested, label_fail_requested, discard_requested, camera_print_requested, wrist_x_print_requested, wrist_y_print_requested, wrist_z_print_requested, activate_pickup_requested, activate_place_requested
         if event.type == carb.input.KeyboardEventType.KEY_PRESS:
             if event.input == carb.input.KeyboardInput.R:
                 reset_requested = True
@@ -1675,7 +1804,9 @@ def main() -> None:
                 or event.input in ARM_SWING_KEYS
                 or event.input in HAND_UPDOWN_KEYS
                 or (event.input in GRIPPER_KEYS and not args.rollout)
-                or (event.input in WRIST_ROTATE_KEYS and not args.rollout)
+                or (event.input in WRIST_X_KEYS and not args.rollout)
+                or (event.input in WRIST_Y_KEYS and not args.rollout)
+                or (event.input in WRIST_Z_KEYS and not args.rollout)
                 or event.input in CAMERA_ROTATE_KEYS_PAN
                 or event.input in CAMERA_ROTATE_KEYS_TILT
             ):
@@ -1683,8 +1814,12 @@ def main() -> None:
         elif event.type == carb.input.KeyboardEventType.KEY_RELEASE:
             if event.input in CAMERA_ROTATE_KEYS_PAN or event.input in CAMERA_ROTATE_KEYS_TILT:
                 camera_print_requested = True
-            if event.input in WRIST_ROTATE_KEYS:
-                wrist_print_requested = True
+            if event.input in WRIST_X_KEYS:
+                wrist_x_print_requested = True
+            if event.input in WRIST_Y_KEYS:
+                wrist_y_print_requested = True
+            if event.input in WRIST_Z_KEYS:
+                wrist_z_print_requested = True
             held_keys.discard(event.input)
         return True
 
@@ -1697,12 +1832,12 @@ def main() -> None:
     print("  Hold J: both hands raise (elbow only). Hold L: both hands lower.")
     if args.rollout:
         print(f"  M: activate PICKUP policy (task={args.task!r}). N: activate PLACE policy (task={args.task2!r}).")
-        print("  Grippers/wrists are policy-controlled in --rollout mode (no manual M/N/C/V control).")
+        print("  Grippers/wrists are policy-controlled in --rollout mode (no manual M/N/C/V/,/./[/] control).")
     else:
         print("  Hold M: both grippers close. Hold N: both grippers open.")
-        print("  Hold C/V: both wrists rotate one way / the other.")
-        print("  Release C or V to print the current wrist angle - use it to find the flat pose,")
-        print("  then paste that value into STARTING_WRIST_ROTATE_RAD so no key press is needed.")
+        print("  Hold C/V: wrist rotate on joint5 (X). , / . : joint6 (Y). [ / ] : joint7 (Z).")
+        print("  Release any wrist key to print its current angle - use it to find a good pose,")
+        print("  then paste that value into STARTING_WRIST_X/Y/Z_RAD so no key press is needed.")
     print("  B: start/stop episode recording. After stop: Y=success, F=failure, Backspace=discard.")
     print("  Arrow keys: rotate the camera (Left/Right pan, Up/Down tilt) - or use the browser's")
     print("  rotate buttons. Prints pan/tilt on release - paste into CAMERA_PAN_DEG/CAMERA_TILT_DEG.")
@@ -1724,6 +1859,14 @@ def main() -> None:
     physics_hz = 1.0 / physics_dt
     watchdog_tripped = False
     gripper_diag_accum = 0.0
+    compliance_tripped = {
+        "joint2_left": False,
+        "joint2_right": False,
+        "joint4": False,
+        "joint5": False,
+        "joint6": False,
+        "joint7": False,
+    }
 
     while simulation_app.is_running():
         for cmd in frame_store.pop_commands():
@@ -1825,7 +1968,9 @@ def main() -> None:
             torso_height_fraction = 0.0
             hand_updown_rad = STARTING_HAND_UPDOWN_RAD
             gripper_rad = 0.0
-            wrist_rotate_rad = STARTING_WRIST_ROTATE_RAD
+            wrist_x_rad = STARTING_WRIST_X_RAD
+            wrist_y_rad = STARTING_WRIST_Y_RAD
+            wrist_z_rad = STARTING_WRIST_Z_RAD
             record_accum = 0.0
             episode_start_pos_xy = None
             episode_forward_dir = None
@@ -1988,6 +2133,25 @@ def main() -> None:
                 watchdog_tripped = False
                 print("[watchdog] cleared - joint velocities back to normal.")
 
+        # Effort-based compliance (see JOINT_EFFORT_LIMIT_NM) - reuses the same effort reading the
+        # watchdog above just took, no extra API call. Returns False (never blocks) if the reading
+        # failed this frame, matching the watchdog's own fail-open behavior right above.
+        def joint_overloaded(name: str) -> bool:
+            if watchdog_effort is None:
+                return False
+            return bool(abs(watchdog_effort[watchdog_index_by_name[name]]) > JOINT_EFFORT_LIMIT_NM)
+
+        def report_compliance(key: str, is_overloaded: bool, label: str) -> None:
+            # Print only on state transitions, not every frame - mirrors watchdog_tripped's
+            # pattern. Without this, a frozen key looks like an unexplained input bug rather than
+            # the deliberate compliance behavior it is.
+            if is_overloaded and not compliance_tripped[key]:
+                compliance_tripped[key] = True
+                print(f"[compliance] {label} overloaded (>{JOINT_EFFORT_LIMIT_NM}Nm) - further motion into load blocked.")
+            elif not is_overloaded and compliance_tripped[key]:
+                compliance_tripped[key] = False
+                print(f"[compliance] {label} cleared - back to normal control.")
+
         if args.rollout:
             # policy_action_vec is the last full 21-dim vector received from policy_server.py (see
             # the record_accum-gated query below) - None until the first prediction of an attempt
@@ -2009,13 +2173,28 @@ def main() -> None:
                 ) + STARTING_RIGHT_ARM_SWING_FRACTION * np.array(ARM_FORWARD_POSE["right"])
                 left_arm_q[ARM_HAND_UPDOWN_JOINT_INDEX] += STARTING_HAND_UPDOWN_RAD
                 right_arm_q[ARM_HAND_UPDOWN_JOINT_INDEX] += STARTING_HAND_UPDOWN_RAD
-                left_arm_q[WRIST_ROTATE_JOINT_INDEX] += STARTING_WRIST_ROTATE_RAD
-                right_arm_q[WRIST_ROTATE_JOINT_INDEX] += STARTING_WRIST_ROTATE_RAD
+                left_arm_q[WRIST_X_JOINT_INDEX] += STARTING_WRIST_X_RAD
+                right_arm_q[WRIST_X_JOINT_INDEX] += STARTING_WRIST_X_RAD
+                left_arm_q[WRIST_Y_JOINT_INDEX] += STARTING_WRIST_Y_RAD
+                right_arm_q[WRIST_Y_JOINT_INDEX] += STARTING_WRIST_Y_RAD
+                left_arm_q[WRIST_Z_JOINT_INDEX] += STARTING_WRIST_Z_RAD
+                right_arm_q[WRIST_Z_JOINT_INDEX] += STARTING_WRIST_Z_RAD
         else:
+            # Compliance: block only the FORWARD (U, direction>0 - toward ARM_FORWARD_POSE, i.e.
+            # further into whatever it's pressed against) increment on a side whose own joint2 is
+            # under high sustained load - O (retreat) always still works regardless, so the escape
+            # path out of an overloaded contact is never blocked.
+            left_joint2_overloaded = joint_overloaded("left_arm_joint2")
+            right_joint2_overloaded = joint_overloaded("right_arm_joint2")
+            report_compliance("joint2_left", left_joint2_overloaded, "left arm swing (joint2)")
+            report_compliance("joint2_right", right_joint2_overloaded, "right arm swing (joint2)")
             for key in held_keys:
                 if key in ARM_SWING_KEYS:
-                    left_arm_swing_fraction += ARM_SWING_KEYS[key] * left_arm_swing_rate * physics_dt
-                    right_arm_swing_fraction += ARM_SWING_KEYS[key] * right_arm_swing_rate * physics_dt
+                    direction = ARM_SWING_KEYS[key]
+                    if not (direction > 0 and left_joint2_overloaded):
+                        left_arm_swing_fraction += direction * left_arm_swing_rate * physics_dt
+                    if not (direction > 0 and right_joint2_overloaded):
+                        right_arm_swing_fraction += direction * right_arm_swing_rate * physics_dt
             left_arm_swing_fraction = float(np.clip(left_arm_swing_fraction, 0.0, 1.0))
             right_arm_swing_fraction = float(np.clip(right_arm_swing_fraction, 0.0, 1.0))
             left_arm_q = (1.0 - left_arm_swing_fraction) * np.array(ARM_OPEN_POSE["left"]) + left_arm_swing_fraction * np.array(
@@ -2025,27 +2204,67 @@ def main() -> None:
                 ARM_OPEN_POSE["right"]
             ) + right_arm_swing_fraction * np.array(ARM_FORWARD_POSE["right"])
 
-            for key in held_keys:
-                if key in HAND_UPDOWN_KEYS:
-                    hand_updown_rad += HAND_UPDOWN_KEYS[key] * args.arm_speed * physics_dt
+            # Compliance: unlike swing above, there's no clear "safe" direction for the elbow under
+            # load (which way relieves force depends on what it's pushing against), so this freezes
+            # both directions entirely once either arm's joint4 is overloaded, rather than guessing.
+            joint4_overloaded = joint_overloaded("left_arm_joint4") or joint_overloaded("right_arm_joint4")
+            report_compliance("joint4", joint4_overloaded, "elbow (joint4)")
+            if not joint4_overloaded:
+                for key in held_keys:
+                    if key in HAND_UPDOWN_KEYS:
+                        hand_updown_rad += HAND_UPDOWN_KEYS[key] * args.arm_speed * physics_dt
             hand_updown_rad = float(np.clip(hand_updown_rad, -ARM_HAND_DOWN_MAX_RAD, ARM_HAND_UP_MAX_RAD))
             left_arm_q[ARM_HAND_UPDOWN_JOINT_INDEX] += hand_updown_rad
             right_arm_q[ARM_HAND_UPDOWN_JOINT_INDEX] += hand_updown_rad
 
-            for key in held_keys:
-                if key in WRIST_ROTATE_KEYS:
-                    wrist_rotate_rad += WRIST_ROTATE_KEYS[key] * args.arm_speed * physics_dt
-            wrist_rotate_rad = float(np.clip(wrist_rotate_rad, WRIST_ROTATE_MIN_RAD, WRIST_ROTATE_MAX_RAD))
-            if wrist_print_requested:
+            # Compliance: same "freeze both directions, no safe-direction guess" reasoning as
+            # joint4 above - this is also the specific joint (wrist-rotate/joint5) that's actually
+            # shown the largest live effort spikes so far (-66.2Nm/-75.1Nm across two separate
+            # pinch-and-push tests), making this the highest-value place this mechanism applies.
+            joint5_overloaded = joint_overloaded("left_arm_joint5") or joint_overloaded("right_arm_joint5")
+            report_compliance("joint5", joint5_overloaded, "wrist rotate X (joint5)")
+            if not joint5_overloaded:
+                for key in held_keys:
+                    if key in WRIST_X_KEYS:
+                        wrist_x_rad += WRIST_X_KEYS[key] * args.arm_speed * physics_dt
+            wrist_x_rad = float(np.clip(wrist_x_rad, WRIST_X_MIN_RAD, WRIST_X_MAX_RAD))
+            if wrist_x_print_requested:
                 # Same "print the value on key release, paste it back into the constant" pattern
-                # as the camera pan/tilt calibration above - STARTING_WRIST_ROTATE_RAD's correct
-                # value can't be derived analytically (see its own comment), so C/V plus this
-                # readout is the actual way to find it: hold C/V until the gripper reads flat
-                # live, then copy the printed radians into STARTING_WRIST_ROTATE_RAD.
-                wrist_print_requested = False
-                print(f"[wrist] joint5={wrist_rotate_rad:+.4f}rad ({np.degrees(wrist_rotate_rad):+.1f}deg)")
-            left_arm_q[WRIST_ROTATE_JOINT_INDEX] += wrist_rotate_rad
-            right_arm_q[WRIST_ROTATE_JOINT_INDEX] += wrist_rotate_rad
+                # as the camera pan/tilt calibration above - neither STARTING_WRIST_X_RAD nor
+                # STARTING_WRIST_Y_RAD can be derived analytically (see their own comment), so
+                # these keys plus this readout are the actual way to find them: hold the axis's
+                # key pair until the gripper reads the pose you want, then copy the printed
+                # radians into the matching constant.
+                wrist_x_print_requested = False
+                print(f"[wrist] joint5={wrist_x_rad:+.4f}rad ({np.degrees(wrist_x_rad):+.1f}deg)")
+            left_arm_q[WRIST_X_JOINT_INDEX] += wrist_x_rad
+            right_arm_q[WRIST_X_JOINT_INDEX] += wrist_x_rad
+
+            joint6_overloaded = joint_overloaded("left_arm_joint6") or joint_overloaded("right_arm_joint6")
+            report_compliance("joint6", joint6_overloaded, "wrist rotate Y (joint6)")
+            if not joint6_overloaded:
+                for key in held_keys:
+                    if key in WRIST_Y_KEYS:
+                        wrist_y_rad += WRIST_Y_KEYS[key] * args.arm_speed * physics_dt
+            wrist_y_rad = float(np.clip(wrist_y_rad, WRIST_Y_MIN_RAD, WRIST_Y_MAX_RAD))
+            if wrist_y_print_requested:
+                wrist_y_print_requested = False
+                print(f"[wrist] joint6={wrist_y_rad:+.4f}rad ({np.degrees(wrist_y_rad):+.1f}deg)")
+            left_arm_q[WRIST_Y_JOINT_INDEX] += wrist_y_rad
+            right_arm_q[WRIST_Y_JOINT_INDEX] += wrist_y_rad
+
+            joint7_overloaded = joint_overloaded("left_arm_joint7") or joint_overloaded("right_arm_joint7")
+            report_compliance("joint7", joint7_overloaded, "wrist rotate Z (joint7)")
+            if not joint7_overloaded:
+                for key in held_keys:
+                    if key in WRIST_Z_KEYS:
+                        wrist_z_rad += WRIST_Z_KEYS[key] * args.arm_speed * physics_dt
+            wrist_z_rad = float(np.clip(wrist_z_rad, WRIST_Z_MIN_RAD, WRIST_Z_MAX_RAD))
+            if wrist_z_print_requested:
+                wrist_z_print_requested = False
+                print(f"[wrist] joint7={wrist_z_rad:+.4f}rad ({np.degrees(wrist_z_rad):+.1f}deg)")
+            left_arm_q[WRIST_Z_JOINT_INDEX] += wrist_z_rad
+            right_arm_q[WRIST_Z_JOINT_INDEX] += wrist_z_rad
 
         # Safety-critical: this clamp (and the matching ones for torso/grippers below) is what
         # guards against the joint-velocity-spike/fling failure mode documented in CLAUDE.md - it
