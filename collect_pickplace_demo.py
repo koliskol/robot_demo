@@ -34,6 +34,9 @@ stream_demo.py/../Robot_project/capture_cube_rgbd.py:
                 press N to activate the place policy (--policy2-host/--policy2-port, task=--task2).
                 Two separate policy_server.py processes must be running, one per checkpoint/port.
                 Switching resets the newly-activated policy's internal action-chunk queue.
+    , / .       hold to rotate both wrists one way / the other (joint7 - the joint right before
+                the gripper, so this spins the hand/gripper itself, not the whole forearm).
+                In --rollout mode this is policy-controlled too, so , and . are inert there.
     R           reset the robot/cube/cart to spawn pose (also discards any in-progress episode)
 
     B           toggle: start recording an episode / stop and await a label
@@ -650,6 +653,32 @@ GRIPPER_KEYS = {
     carb.input.KeyboardInput.M: 1.0,  # toward closed
 }
 GRIPPER_MAX_LEAD_RAD = 0.008
+
+# Comma/period jog joint7 - the last joint before the gripper, spinning it (and the whole hand)
+# about its own axis. Confirmed from ../Robot_project/urdf/galbot_g1_{left,right}_arm.urdf (the
+# same offline-generated URDF ARM_FORWARD_POSE/ARM_HAND_UPDOWN_JOINT_INDEX above were derived
+# from, not guessed): joint5/6/7 form a concurrent (zero-offset) spherical wrist mounted directly
+# on link6/link7 with the gripper attached straight after joint7 - unlike joint2/joint4, which
+# were picked from an FK sensitivity sweep among several candidates, joint7 is the only one of
+# the three wrist joints with nothing after it but the gripper itself, making it the direct
+# "rotate the gripper" control. joints 1, 3, 5, 6 are intentionally left locked at 0 - per this
+# file's docstring, the rest of the arm stays a straight, rigid rod for the hug technique, and
+# this is the one addition to that. Its hard limit (+-1.5382 rad, both arms - read directly from
+# the URDF's <limit> tag, not estimated) is used as-is with no extra margin.
+#
+# UNVERIFIED LIVE (no Isaac Sim available while writing this): the sign is applied identically to
+# both arms, same as HAND_UPDOWN_KEYS above, on the assumption that the mirrored arm mount cancels
+# out the same way it apparently does for joint4 (whose raw URDF axis also differs sign between
+# arms, yet the existing code needs no per-arm correction) - confirm live, and flip
+# WRIST_ROTATE_KEYS' sign for one arm specifically (not both, unlike a backwards J/L) if only one
+# hand rotates the wrong way.
+WRIST_ROTATE_JOINT_INDEX = 6  # joint7, 0-indexed into the 7-joint [joint1..joint7] chain
+WRIST_ROTATE_MIN_RAD = -1.5382
+WRIST_ROTATE_MAX_RAD = 1.5382
+WRIST_ROTATE_KEYS = {
+    carb.input.KeyboardInput.COMMA: -1.0,
+    carb.input.KeyboardInput.PERIOD: 1.0,
+}
 
 TORSO_UP_POSE = [0.0, 0.0, 0.0, 0.0, 0.0]
 TORSO_DOWN_POSE = [0.8, 2.3, 1.55, 0.0, 0.0]
@@ -1387,6 +1416,7 @@ def main() -> None:
     torso_height_fraction = 0.0
     hand_updown_rad = STARTING_HAND_UPDOWN_RAD
     gripper_rad = 0.0
+    wrist_rotate_rad = 0.0
 
     # Live viewing only (see module docstring) - not the recorder, which samples separately at a
     # fixed rate below. No depth/lidar here, so the browser page's depth/map/point-cloud panels
@@ -1432,6 +1462,7 @@ def main() -> None:
                 or event.input in ARM_SWING_KEYS
                 or event.input in HAND_UPDOWN_KEYS
                 or (event.input in GRIPPER_KEYS and not args.rollout)
+                or (event.input in WRIST_ROTATE_KEYS and not args.rollout)
                 or event.input in CAMERA_ROTATE_KEYS_PAN
                 or event.input in CAMERA_ROTATE_KEYS_TILT
             ):
@@ -1451,9 +1482,10 @@ def main() -> None:
     print("  Hold J: both hands raise (elbow only). Hold L: both hands lower.")
     if args.rollout:
         print(f"  M: activate PICKUP policy (task={args.task!r}). N: activate PLACE policy (task={args.task2!r}).")
-        print("  Grippers are policy-controlled in --rollout mode (no manual M/N gripper control).")
+        print("  Grippers/wrists are policy-controlled in --rollout mode (no manual M/N/,/. control).")
     else:
         print("  Hold M: both grippers close. Hold N: both grippers open.")
+        print("  Hold , (comma): both wrists rotate one way. Hold . (period): the other way.")
     print("  B: start/stop episode recording. After stop: Y=success, F=failure, Backspace=discard.")
     print("  Arrow keys: rotate the camera (Left/Right pan, Up/Down tilt) - or use the browser's")
     print("  rotate buttons. Prints pan/tilt on release - paste into CAMERA_PAN_DEG/CAMERA_TILT_DEG.")
@@ -1566,6 +1598,7 @@ def main() -> None:
             torso_height_fraction = 0.0
             hand_updown_rad = STARTING_HAND_UPDOWN_RAD
             gripper_rad = 0.0
+            wrist_rotate_rad = 0.0
             record_accum = 0.0
             episode_start_pos_xy = None
             episode_forward_dir = None
@@ -1740,6 +1773,13 @@ def main() -> None:
             hand_updown_rad = float(np.clip(hand_updown_rad, -ARM_HAND_DOWN_MAX_RAD, ARM_HAND_UP_MAX_RAD))
             left_arm_q[ARM_HAND_UPDOWN_JOINT_INDEX] += hand_updown_rad
             right_arm_q[ARM_HAND_UPDOWN_JOINT_INDEX] += hand_updown_rad
+
+            for key in held_keys:
+                if key in WRIST_ROTATE_KEYS:
+                    wrist_rotate_rad += WRIST_ROTATE_KEYS[key] * args.arm_speed * physics_dt
+            wrist_rotate_rad = float(np.clip(wrist_rotate_rad, WRIST_ROTATE_MIN_RAD, WRIST_ROTATE_MAX_RAD))
+            left_arm_q[WRIST_ROTATE_JOINT_INDEX] += wrist_rotate_rad
+            right_arm_q[WRIST_ROTATE_JOINT_INDEX] += wrist_rotate_rad
 
         # Safety-critical: this clamp (and the matching ones for torso/grippers below) is what
         # guards against the joint-velocity-spike/fling failure mode documented in CLAUDE.md - it
