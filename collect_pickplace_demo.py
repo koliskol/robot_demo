@@ -182,6 +182,15 @@ parser.add_argument(
     help="See --cube-scale-min.",
 )
 parser.add_argument(
+    "--cube-scale-cycle",
+    action="store_true",
+    help="Requires --cube-scale-min/--cube-scale-max. Instead of sampling the main box's scale "
+    "uniformly at random, step deterministically through small (--cube-scale-min) -> medium "
+    "(the midpoint) -> big (--cube-scale-max) -> back to small, advancing one step on every "
+    "spawn/reset (including the very first spawn) rather than drawing at random. Combine with "
+    "--no-extra-boxes if you want exactly one box on screen at a time.",
+)
+parser.add_argument(
     "--box-jitter-m",
     type=float,
     default=0.03,
@@ -277,6 +286,8 @@ if (args.cube_scale_min is None) != (args.cube_scale_max is None):
     parser.error("--cube-scale-min and --cube-scale-max must be given together.")
 if args.cube_scale_min is not None and not (0.0 < args.cube_scale_min <= args.cube_scale_max):
     parser.error(f"--cube-scale-min ({args.cube_scale_min}) must be > 0 and <= --cube-scale-max ({args.cube_scale_max}).")
+if args.cube_scale_cycle and args.cube_scale_min is None:
+    parser.error("--cube-scale-cycle requires --cube-scale-min/--cube-scale-max to also be set.")
 if args.task is None:
     args.task = f"pick_box_table_to_{args.place_target}" if args.cube_start == "table" else f"pick_box_{args.place_target}_to_table"
 if args.rollout and args.out == parser.get_default("out"):
@@ -793,13 +804,18 @@ def sample_pose_jitter(rng: np.random.Generator, jitter_m: float, yaw_jitter_deg
     return dx, dy, yaw_deg, yaw_quat
 
 
-def sample_cube_scale(rng: np.random.Generator, args) -> float:
+def sample_cube_scale(rng: np.random.Generator, args, cycle_index: int = 0) -> float:
     """The main box's scale for one spawn/reset - fixed at --cube-scale unless --cube-scale-min/
-    --cube-scale-max are both set (validated together at argparse time), in which case it's drawn
-    uniformly from that range instead. See --cube-scale-min's help for why this exists and its
+    --cube-scale-max are both set (validated together at argparse time). With --cube-scale-cycle,
+    steps deterministically through small (min) -> medium (midpoint) -> big (max) -> repeat, keyed
+    off cycle_index (the caller's spawn/reset counter, not randomized); otherwise drawn uniformly
+    at random from [min, max]. See --cube-scale-min's help for why this exists and its
     live-verification caveat."""
     if args.cube_scale_min is None:
         return args.cube_scale
+    if args.cube_scale_cycle:
+        sizes = (args.cube_scale_min, (args.cube_scale_min + args.cube_scale_max) / 2.0, args.cube_scale_max)
+        return sizes[cycle_index % 3]
     return float(rng.uniform(args.cube_scale_min, args.cube_scale_max))
 
 
@@ -1183,7 +1199,10 @@ def main() -> None:
     box_center_x, box_center_y = (table_center_x, table_center_y) if args.cube_start == "table" else (target_x, target_y)
     box_surface_z = table_top_z if args.cube_start == "table" else target_top_z
     box_dx, box_dy, box_yaw_deg, box_yaw_quat = sample_pose_jitter(rng, args.box_jitter_m, args.box_yaw_jitter_deg)
-    box_scale = sample_cube_scale(rng, args)
+    # Counts spawns/resets for --cube-scale-cycle's deterministic small->medium->big progression
+    # (index 0 = small, at this very first spawn). Unused when --cube-scale-cycle is off.
+    cube_scale_cycle_index = 0
+    box_scale = sample_cube_scale(rng, args, cube_scale_cycle_index)
     main_box_aabb = spawn_real_box(
         bbox_cache, assets_root_path, BOX_ASSET_MAIN, "/World/Cube",
         x=box_center_x + box_dx, y=box_center_y + box_dy, surface_z=box_surface_z, scale=box_scale, mass=args.cube_mass,
@@ -1494,7 +1513,8 @@ def main() -> None:
                 # Isaac Sim - confirm PhysX actually picks up the new body (no console errors, box
                 # settles/responds normally) and that the hug still converges across your chosen
                 # --cube-scale-min/--cube-scale-max range before trusting this for real collection.
-                box_scale = sample_cube_scale(rng, args)
+                cube_scale_cycle_index += 1
+                box_scale = sample_cube_scale(rng, args, cube_scale_cycle_index)
                 delete_prim("/World/Cube")
                 spawn_real_box(
                     bbox_cache, assets_root_path, BOX_ASSET_MAIN, "/World/Cube",
