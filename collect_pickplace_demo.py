@@ -29,6 +29,11 @@ stream_demo.py/../Robot_project/capture_cube_rgbd.py:
     J / L       hold to raise / lower both hands (elbow joint only)
     M / N       hold to close / open both grippers (optional - the hug, not the gripper, is the
                 primary hold; fingers can add a little extra contact but aren't required)
+                In --rollout mode, grippers are policy-controlled instead, so M/N are repurposed:
+                press M to activate the pickup policy (--policy-host/--policy-port, task=--task),
+                press N to activate the place policy (--policy2-host/--policy2-port, task=--task2).
+                Two separate policy_server.py processes must be running, one per checkpoint/port.
+                Switching resets the newly-activated policy's internal action-chunk queue.
     R           reset the robot/cube/cart to spawn pose (also discards any in-progress episode)
 
     B           toggle: start recording an episode / stop and await a label
@@ -99,9 +104,12 @@ parser.add_argument(
     "(no way to visually confirm a hug succeeds from a non-interactive session), re-check the "
     "Stage 0-style reach cycle by eye before trusting it.",
 )
-parser.add_argument("--policy-host", type=str, default="127.0.0.1", help="policy_server.py host, only used with --rollout.")
-parser.add_argument("--policy-port", type=int, default=8765, help="policy_server.py port, only used with --rollout.")
-parser.add_argument("--task", type=str, default=None, help="Task name stored in each episode's manifest (default: derived from --cube-start).")
+parser.add_argument("--policy-host", type=str, default="127.0.0.1", help="policy_server.py host for the pickup policy (M key), only used with --rollout.")
+parser.add_argument("--policy-port", type=int, default=8765, help="policy_server.py port for the pickup policy (M key), only used with --rollout.")
+parser.add_argument("--policy2-host", type=str, default="127.0.0.1", help="policy_server.py host for the place policy (N key), only used with --rollout.")
+parser.add_argument("--policy2-port", type=int, default=8766, help="policy_server.py port for the place policy (N key), only used with --rollout.")
+parser.add_argument("--task", type=str, default=None, help="Task name stored in each episode's manifest (default: derived from --cube-start). Also the task label sent to the pickup policy (M key) during --rollout.")
+parser.add_argument("--task2", type=str, default="place_policy", help="Task label sent to the place policy (N key) during --rollout - independent of --task, which covers the pickup policy in this mode.")
 parser.add_argument(
     "--place-target",
     type=str,
@@ -152,6 +160,26 @@ parser.add_argument(
     default=0.15,
     help="Main box mass in kg - overrides the asset's own authored mass. Kept light-to-moderate "
     "since the hold is friction-only (arm compression), not a joint-based attach.",
+)
+parser.add_argument(
+    "--cube-scale-min",
+    type=float,
+    default=None,
+    help="If set together with --cube-scale-max, randomize the main box's scale uniformly in "
+    "[min, max] on every spawn/reset instead of the fixed --cube-scale - real recorded sessions so "
+    "far all used one fixed scale per session, so the trained policy has never seen box-size "
+    "variation. Opt-in and unset by default so existing workflows are unaffected. Unlike the "
+    "position/yaw jitter above, this respawns the box prim from scratch each reset (delete + "
+    "re-reference + re-place), since place_on_surface's scale-then-measure trick only gives the "
+    "right footprint at a prim's just-referenced identity transform - not yet live-verified, "
+    "re-run the Stage 0 reach/hug cycle across your chosen range before trusting it for real "
+    "collection.",
+)
+parser.add_argument(
+    "--cube-scale-max",
+    type=float,
+    default=None,
+    help="See --cube-scale-min.",
 )
 parser.add_argument(
     "--box-jitter-m",
@@ -245,6 +273,10 @@ parser.add_argument("--torso-speed", type=float, default=0.4, help="Torso up/dow
 args = parser.parse_args()
 if args.cube_start not in ("table", args.place_target):
     parser.error(f"--cube-start {args.cube_start!r} requires --place-target {args.cube_start!r} (got --place-target {args.place_target!r})")
+if (args.cube_scale_min is None) != (args.cube_scale_max is None):
+    parser.error("--cube-scale-min and --cube-scale-max must be given together.")
+if args.cube_scale_min is not None and not (0.0 < args.cube_scale_min <= args.cube_scale_max):
+    parser.error(f"--cube-scale-min ({args.cube_scale_min}) must be > 0 and <= --cube-scale-max ({args.cube_scale_max}).")
 if args.task is None:
     args.task = f"pick_box_table_to_{args.place_target}" if args.cube_start == "table" else f"pick_box_{args.place_target}_to_table"
 if args.rollout and args.out == parser.get_default("out"):
@@ -265,7 +297,7 @@ import isaacsim.core.utils.bounds as bounds_utils
 from PIL import Image
 from isaacsim.core.api import World
 from isaacsim.core.prims import SingleArticulation, SingleXFormPrim
-from isaacsim.core.utils.prims import get_prim_at_path
+from isaacsim.core.utils.prims import delete_prim, get_prim_at_path
 from isaacsim.core.utils.stage import add_reference_to_stage, get_current_stage
 from isaacsim.core.utils.types import ArticulationAction
 from isaacsim.robot.wheeled_robots.controllers.holonomic_controller import HolonomicController
@@ -761,6 +793,16 @@ def sample_pose_jitter(rng: np.random.Generator, jitter_m: float, yaw_jitter_deg
     return dx, dy, yaw_deg, yaw_quat
 
 
+def sample_cube_scale(rng: np.random.Generator, args) -> float:
+    """The main box's scale for one spawn/reset - fixed at --cube-scale unless --cube-scale-min/
+    --cube-scale-max are both set (validated together at argparse time), in which case it's drawn
+    uniformly from that range instead. See --cube-scale-min's help for why this exists and its
+    live-verification caveat."""
+    if args.cube_scale_min is None:
+        return args.cube_scale
+    return float(rng.uniform(args.cube_scale_min, args.cube_scale_max))
+
+
 def place_on_ground(bbox_cache, prim_path: str, x: float, y: float, scale: float = 1.0, z_scale: float = None) -> np.ndarray:
     """Move a freshly-referenced (identity-transform) prim so its footprint is centered at
     (x, y) and its lowest point rests on z=0. Ported from
@@ -1141,15 +1183,16 @@ def main() -> None:
     box_center_x, box_center_y = (table_center_x, table_center_y) if args.cube_start == "table" else (target_x, target_y)
     box_surface_z = table_top_z if args.cube_start == "table" else target_top_z
     box_dx, box_dy, box_yaw_deg, box_yaw_quat = sample_pose_jitter(rng, args.box_jitter_m, args.box_yaw_jitter_deg)
+    box_scale = sample_cube_scale(rng, args)
     main_box_aabb = spawn_real_box(
         bbox_cache, assets_root_path, BOX_ASSET_MAIN, "/World/Cube",
-        x=box_center_x + box_dx, y=box_center_y + box_dy, surface_z=box_surface_z, scale=args.cube_scale, mass=args.cube_mass,
+        x=box_center_x + box_dx, y=box_center_y + box_dy, surface_z=box_surface_z, scale=box_scale, mass=args.cube_mass,
     )
     box_xform = SingleXFormPrim("/World/Cube")
     box_xform.set_world_pose(orientation=box_yaw_quat)
     box_anchor_z = float(box_xform.get_world_pose()[0][2])
     print(
-        f"[box] initial spawn offset dx={box_dx:+.3f}m dy={box_dy:+.3f}m yaw={box_yaw_deg:+.1f}deg "
+        f"[box] initial spawn offset dx={box_dx:+.3f}m dy={box_dy:+.3f}m yaw={box_yaw_deg:+.1f}deg scale={box_scale:.3f} "
         f"(--box-jitter-m={args.box_jitter_m} --box-yaw-jitter-deg={args.box_yaw_jitter_deg})"
     )
 
@@ -1274,7 +1317,10 @@ def main() -> None:
     # --rollout: connect now and fail fast if policy_server.py isn't reachable - a --rollout run
     # with no policy behind it is a misconfiguration, not a valid mode, so this deliberately
     # doesn't fall back to teleop silently.
-    policy_client = None
+    policy_client_pickup = None
+    policy_client_place = None
+    active_policy_client = None  # None until M (pickup) or N (place) is pressed - see on_keyboard_event
+    active_task = None
     policy_action_vec = None  # last action received from the server; None until the first predict
     # chassis_forward reference frame (see state_names above) - (position, forward unit vector) at
     # the start of the current recording attempt, set on every B-press-start and R-reset. None
@@ -1282,9 +1328,12 @@ def main() -> None:
     episode_start_pos_xy = None
     episode_forward_dir = None
     if args.rollout:
-        policy_client = PolicyClient(args.policy_host, args.policy_port)
-        policy_client.connect()
-        print(f"[rollout] connected to policy_server.py at {args.policy_host}:{args.policy_port}")
+        policy_client_pickup = PolicyClient(args.policy_host, args.policy_port)
+        policy_client_pickup.connect()
+        print(f"[rollout] connected to pickup policy_server.py at {args.policy_host}:{args.policy_port} (activate with M)")
+        policy_client_place = PolicyClient(args.policy2_host, args.policy2_port)
+        policy_client_place.connect()
+        print(f"[rollout] connected to place policy_server.py at {args.policy2_host}:{args.policy2_port} (activate with N)")
 
     left_arm_swing_rate = arm_swing_rate("left", args.arm_speed)
     right_arm_swing_rate = arm_swing_rate("right", args.arm_speed)
@@ -1309,9 +1358,11 @@ def main() -> None:
     label_fail_requested = False
     discard_requested = False
     camera_print_requested = False
+    activate_pickup_requested = False
+    activate_place_requested = False
 
     def on_keyboard_event(event, *_args, **_kwargs) -> bool:
-        nonlocal reset_requested, record_requested, label_success_requested, label_fail_requested, discard_requested, camera_print_requested
+        nonlocal reset_requested, record_requested, label_success_requested, label_fail_requested, discard_requested, camera_print_requested, activate_pickup_requested, activate_place_requested
         if event.type == carb.input.KeyboardEventType.KEY_PRESS:
             if event.input == carb.input.KeyboardInput.R:
                 reset_requested = True
@@ -1323,12 +1374,19 @@ def main() -> None:
                 label_fail_requested = True
             elif event.input == carb.input.KeyboardInput.BACKSPACE:
                 discard_requested = True
+            elif args.rollout and event.input == carb.input.KeyboardInput.M:
+                # In --rollout mode grippers are policy-controlled (see the gripper block below),
+                # so M/N are free to repurpose as pickup/place policy selectors instead of their
+                # teleop-mode meaning (close/open grippers).
+                activate_pickup_requested = True
+            elif args.rollout and event.input == carb.input.KeyboardInput.N:
+                activate_place_requested = True
             elif (
                 event.input in DRIVE_KEY_AXES
                 or event.input in TORSO_HEIGHT_KEYS
                 or event.input in ARM_SWING_KEYS
                 or event.input in HAND_UPDOWN_KEYS
-                or event.input in GRIPPER_KEYS
+                or (event.input in GRIPPER_KEYS and not args.rollout)
                 or event.input in CAMERA_ROTATE_KEYS_PAN
                 or event.input in CAMERA_ROTATE_KEYS_TILT
             ):
@@ -1346,7 +1404,11 @@ def main() -> None:
     print("Controls: W/S drive forward/back, A/D strafe left/right, Q/E rotate, I/K torso up/down.")
     print("  Hold U: both arms swing forward (shoulder only). Hold O: swing back to open.")
     print("  Hold J: both hands raise (elbow only). Hold L: both hands lower.")
-    print("  Hold M: both grippers close. Hold N: both grippers open.")
+    if args.rollout:
+        print(f"  M: activate PICKUP policy (task={args.task!r}). N: activate PLACE policy (task={args.task2!r}).")
+        print("  Grippers are policy-controlled in --rollout mode (no manual M/N gripper control).")
+    else:
+        print("  Hold M: both grippers close. Hold N: both grippers open.")
     print("  B: start/stop episode recording. After stop: Y=success, F=failure, Backspace=discard.")
     print("  Arrow keys: rotate the camera (Left/Right pan, Up/Down tilt) - or use the browser's")
     print("  rotate buttons. Prints pan/tilt on release - paste into CAMERA_PAN_DEG/CAMERA_TILT_DEG.")
@@ -1355,6 +1417,9 @@ def main() -> None:
     physics_dt = world.get_physics_dt()
     record_period = 1.0 / args.record_fps
     record_accum = 0.0
+    consecutive_none_joint_frames = 0
+    # Physics sim step rate (60Hz default) - used only to size the stuck-view bailout below.
+    physics_hz = 1.0 / physics_dt
 
     while simulation_app.is_running():
         for cmd in frame_store.pop_commands():
@@ -1394,6 +1459,17 @@ def main() -> None:
                 recorder_state = RecorderState.IDLE
             world.reset()
             robot.initialize()
+            # world.reset()/robot.initialize() invalidate the articulation's physics simulation
+            # view; it isn't recreated until a physics step runs. One step wasn't reliably enough
+            # (confirmed live: a later session still hit get_joint_positions()==None ~7 minutes
+            # after a reset, well past any single-step race) - bounded-retry until it comes back,
+            # same pattern as the initial 60-step warmup after the very first world.reset() above.
+            for _ in range(60):
+                world.step(render=True)
+                if robot.get_joint_positions() is not None:
+                    break
+            else:
+                print("[warning] physics simulation view did not come back after reset within 60 steps")
             if table2_xform is not None:
                 table2_dx, table2_dy, table2_yaw_deg, table2_yaw_quat = sample_pose_jitter(
                     rng, args.table2_jitter_m, args.table2_yaw_jitter_deg
@@ -1407,13 +1483,38 @@ def main() -> None:
                     f"dy={table2_dy:+.3f}m yaw={table2_yaw_deg:+.1f}deg"
                 )
             box_dx, box_dy, box_yaw_deg, box_yaw_quat = sample_pose_jitter(rng, args.box_jitter_m, args.box_yaw_jitter_deg)
-            box_xform.set_world_pose(
-                position=np.array([box_center_x + box_dx, box_center_y + box_dy, box_anchor_z]),
-                orientation=box_yaw_quat,
-            )
-            print(
-                f"[box] episode {recorder.episode_index:04d} spawn offset dx={box_dx:+.3f}m dy={box_dy:+.3f}m yaw={box_yaw_deg:+.1f}deg"
-            )
+            if args.cube_scale_min is not None:
+                # Unlike the position/yaw-only branch below, scale can't be applied by just moving
+                # the existing prim - place_on_surface's scale-then-measure trick only measures the
+                # right footprint at a prim's just-referenced identity transform (see its
+                # docstring), so this respawns /World/Cube from scratch every reset: delete, then
+                # re-reference + re-place via spawn_real_box, same as the initial spawn above.
+                # UNVERIFIED LIVE: deleting and re-authoring a dynamic RigidBodyAPI prim mid-session
+                # (physics already running past the first world.reset()) hasn't been watched in
+                # Isaac Sim - confirm PhysX actually picks up the new body (no console errors, box
+                # settles/responds normally) and that the hug still converges across your chosen
+                # --cube-scale-min/--cube-scale-max range before trusting this for real collection.
+                box_scale = sample_cube_scale(rng, args)
+                delete_prim("/World/Cube")
+                spawn_real_box(
+                    bbox_cache, assets_root_path, BOX_ASSET_MAIN, "/World/Cube",
+                    x=box_center_x + box_dx, y=box_center_y + box_dy, surface_z=box_surface_z, scale=box_scale, mass=args.cube_mass,
+                )
+                box_xform = SingleXFormPrim("/World/Cube")
+                box_xform.set_world_pose(orientation=box_yaw_quat)
+                box_anchor_z = float(box_xform.get_world_pose()[0][2])
+                print(
+                    f"[box] episode {recorder.episode_index:04d} spawn offset dx={box_dx:+.3f}m dy={box_dy:+.3f}m "
+                    f"yaw={box_yaw_deg:+.1f}deg scale={box_scale:.3f}"
+                )
+            else:
+                box_xform.set_world_pose(
+                    position=np.array([box_center_x + box_dx, box_center_y + box_dy, box_anchor_z]),
+                    orientation=box_yaw_quat,
+                )
+                print(
+                    f"[box] episode {recorder.episode_index:04d} spawn offset dx={box_dx:+.3f}m dy={box_dy:+.3f}m yaw={box_yaw_deg:+.1f}deg"
+                )
             left_arm_swing_fraction = STARTING_LEFT_ARM_SWING_FRACTION
             right_arm_swing_fraction = STARTING_RIGHT_ARM_SWING_FRACTION
             torso_height_fraction = 0.0
@@ -1426,23 +1527,76 @@ def main() -> None:
                 policy_action_vec = None
             continue
 
+        if activate_pickup_requested:
+            activate_pickup_requested = False
+            if args.rollout:
+                active_policy_client = policy_client_pickup
+                active_task = args.task
+                active_policy_client.reset()
+                policy_action_vec = None
+                recorder.task_name = active_task
+                print(f"[rollout] active policy -> PICKUP (task={active_task!r})")
+                if recorder_state is RecorderState.IDLE:
+                    # M alone starts the attempt too - no separate B press needed. Only auto-starts
+                    # from IDLE; if a recording is already in progress (e.g. mid pickup->place
+                    # switch), M/N just swaps the active policy without touching it.
+                    recorder.start()
+                    recorder_state = RecorderState.RECORDING
+                    record_accum = 0.0
+                    episode_start_pos_xy, episode_forward_dir = robot_forward_reference(robot)
+                    print(f"[episode {recorder.episode_index:04d}] recording started")
+
+        if activate_place_requested:
+            activate_place_requested = False
+            if args.rollout:
+                active_policy_client = policy_client_place
+                active_task = args.task2
+                active_policy_client.reset()
+                policy_action_vec = None
+                recorder.task_name = active_task
+                print(f"[rollout] active policy -> PLACE (task={active_task!r})")
+                if recorder_state is RecorderState.IDLE:
+                    recorder.start()
+                    recorder_state = RecorderState.RECORDING
+                    record_accum = 0.0
+                    episode_start_pos_xy, episode_forward_dir = robot_forward_reference(robot)
+                    print(f"[episode {recorder.episode_index:04d}] recording started")
+
         if record_requested:
             record_requested = False
             if recorder_state is RecorderState.IDLE:
+                if args.rollout and active_policy_client is None:
+                    print("[rollout] no policy activated yet - press M (pickup) or N (place) before B.")
                 recorder.start()
                 recorder_state = RecorderState.RECORDING
                 record_accum = 0.0
                 episode_start_pos_xy, episode_forward_dir = robot_forward_reference(robot)
-                if args.rollout:
-                    policy_client.reset()
+                if args.rollout and active_policy_client is not None:
+                    active_policy_client.reset()
                     policy_action_vec = None
                 print(f"[episode {recorder.episode_index:04d}] recording started")
             elif recorder_state is RecorderState.RECORDING:
                 recorder_state = RecorderState.AWAITING_LABEL
+                if args.rollout:
+                    # Release the chassis_forward override (see the command[0] override below)
+                    # the moment recording stops, so manual W/S driving between attempts works
+                    # without needing an extra M/N tap to reset it - policy_action_vec would
+                    # otherwise stay frozen at its last predicted value forever, since predict()
+                    # only runs while RECORDING.
+                    policy_action_vec = None
                 print(
                     f"[episode {recorder.episode_index:04d}] recording stopped "
                     f"({len(recorder.frames)} frames) - press Y (success) / F (fail) / Backspace (discard)"
                 )
+
+        if label_success_requested or label_fail_requested or discard_requested:
+            # Y/F/Backspace now double as the "stop" action too - no separate B press needed to
+            # end an attempt. Falls through into the AWAITING_LABEL handling right below with the
+            # same save/discard semantics as before.
+            if recorder_state is RecorderState.RECORDING:
+                recorder_state = RecorderState.AWAITING_LABEL
+                if args.rollout:
+                    policy_action_vec = None
 
         if label_success_requested:
             label_success_requested = False
@@ -1482,6 +1636,22 @@ def main() -> None:
         robot.apply_action(ArticulationAction(joint_velocities=action.joint_velocities, joint_indices=wheel_dof_indices))
 
         actual_q = robot.get_joint_positions()
+        if actual_q is None:
+            # Physics simulation view momentarily gone - either a reset just ran (guarded against
+            # above, but not always enough - confirmed live) or the viewport window is being
+            # closed and simulation_app.is_running() hasn't caught up yet. Must still call
+            # world.step() every iteration here - a bare `continue` was tried and confirmed live to
+            # spin forever without ever stepping physics, since world.step() otherwise only runs at
+            # the bottom of this loop, generating 10M+ log lines in minutes before it had to be
+            # force-killed. Bail out loudly rather than spin forever if the view never comes back
+            # (e.g. mid window-close, where it's expected to stay None until exit).
+            world.step(render=True)
+            consecutive_none_joint_frames += 1
+            if consecutive_none_joint_frames > 5 * physics_hz:
+                print("[error] physics simulation view has not recovered in 5s - exiting.")
+                break
+            continue
+        consecutive_none_joint_frames = 0
 
         if args.rollout:
             # policy_action_vec is the last full 21-dim vector received from policy_server.py (see
@@ -1596,21 +1766,23 @@ def main() -> None:
             state_vec = np.concatenate(
                 [robot.get_joint_positions()[state_dof_indices], [chassis_forward_state]]
             ).astype(np.float32)
-            if args.rollout and rgba is not None:
+            if args.rollout and rgba is not None and active_policy_client is not None:
                 # Query at the same record_fps cadence the policy was trained at. This is the
                 # observation-to-action edge of the loop: the frame/state captured just above
                 # becomes the target used by the joint-control block above on the *next* iteration
                 # (one physics step of latency, ~1/60s at default settings - negligible, and no
                 # different in kind from any real inference pipeline's latency).
-                policy_action_vec = policy_client.predict(rgba[:, :, :3], state_vec, args.task)
+                policy_action_vec = active_policy_client.predict(rgba[:, :, :3], state_vec, active_task)
             if rgba is not None and depth is not None:
                 action_vec = np.concatenate(
                     [left_arm_q, right_arm_q, torso_q, left_gripper_q, right_gripper_q, [command[0]]]
                 ).astype(np.float32)
                 recorder.append(rgba, depth, state_vec, action_vec)
 
-    if policy_client is not None:
-        policy_client.close()
+    if policy_client_pickup is not None:
+        policy_client_pickup.close()
+    if policy_client_place is not None:
+        policy_client_place.close()
     simulation_app.close()
 
 
