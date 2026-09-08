@@ -918,14 +918,30 @@ def spawn_real_box(
 # one change: a deck_riser_height parameter (see pushcart_deck_top_z / --deck-riser) inserted
 # between the caster assembly and the deck, since the stock ~0.15m deck height was designed for
 # "push by the handle," not "place a box here," and is likely well below table height.
-PUSHCART_DECK_HALF_EXTENT = (0.45, 0.225)  # width (x) widened from 0.3 - see TUTORIAL.md's "0.6m width" note
-PUSHCART_DECK_THICKNESS = 0.03
-PUSHCART_WHEEL_RADIUS = 0.05
-PUSHCART_HANDLE_POST_HEIGHT = 0.75
-PUSHCART_CHASSIS_MASS = 4.4
-PUSHCART_FORK_MASS = 0.05
-PUSHCART_WHEEL_MASS = 0.1
+#
+# Sized up from the original (0.45, 0.225)/0.05 wheel radius/4.4kg per request: bigger deck
+# footprint, taller undercarriage (bigger wheel radius raises deck_bottom_z - see
+# pushcart_deck_top_z), and much heavier chassis so an accidental touch during the hug doesn't
+# send it rolling. UNVERIFIED LIVE - re-run the Stage 0 reach/hug cycle and re-check
+# --deck-riser/ROBOT_APPROACH_GAP_M/CART_TABLE_GAP_M against the new taller/bigger geometry before
+# trusting it for real collection.
+PUSHCART_DECK_HALF_EXTENT = (0.55, 0.30)  # was (0.45, 0.225) - bigger deck footprint
+PUSHCART_DECK_THICKNESS = 0.04  # was 0.03
+PUSHCART_WHEEL_RADIUS = 0.08  # was 0.05 - raises deck_bottom_z, making the whole cart taller
+PUSHCART_HANDLE_POST_HEIGHT = 0.85  # was 0.75
+PUSHCART_CHASSIS_MASS = 25.0  # was 4.4kg - heavy enough to resist an accidental bump
+PUSHCART_FORK_MASS = 0.08  # was 0.05
+PUSHCART_WHEEL_MASS = 0.2  # was 0.1 - bigger sphere wheels (see Wheel{i} below)
 CASTER_ROLLING_FRICTION_NM = 0.05
+
+# Which side of the deck (in the cart's own local +/-X) the handle sits on - the caster/deck
+# layout is otherwise symmetric under a 180deg yaw about Z, so "rotate the cart to the opposite
+# side" is just this sign flip rather than an actual authored rotation. +1 = handle on the +X
+# side (this project's new default, per request - "opposite side" from the original -1); -1 = the
+# original side, ported as-is from capture_cube_rgbd.py. Flip back to -1 if the new side reads
+# wrong once viewed live (e.g. the handle ends up on the side facing the robot's approach instead
+# of away from it).
+PUSHCART_HANDLE_SIDE_SIGN = 1.0
 
 
 def pushcart_deck_top_z(deck_riser_height: float) -> float:
@@ -940,9 +956,10 @@ def build_pushcart(stage, prim_path: str, x: float, y: float, deck_riser_height:
     """Author a pushcart directly with UsdGeom/UsdPhysics primitives - see
     ../Robot_project/capture_cube_rgbd.py's build_pushcart docstring for the full derivation
     (why 9 rigid bodies, why free-swiveling casters carry Coulomb friction instead of being
-    frictionless or welded, etc.). Identical to that version except deck_riser_height, which
-    raises the deck (and its collision box) above the stock ~0.15m height without touching the
-    already-stability-tuned caster fork/wheel joint geometry.
+    frictionless or welded, etc.). Differs from that version in deck_riser_height (raises the deck
+    above the stock ~0.15m height, see pushcart_deck_top_z), PUSHCART_HANDLE_SIDE_SIGN (which side
+    of the deck the handle sits on), and sized-up/heavier constants - see the constants block
+    above for what changed and why. Caster fork/wheel joint geometry itself is untouched.
     """
     dx, dy = PUSHCART_DECK_HALF_EXTENT
     deck_top_z = pushcart_deck_top_z(deck_riser_height)
@@ -976,16 +993,25 @@ def build_pushcart(stage, prim_path: str, x: float, y: float, deck_riser_height:
         swivel.CreateLocalPos1Attr().Set(Gf.Vec3f(0.0, 0.0, 0.0))
         PhysxSchema.PhysxJointAPI.Apply(swivel.GetPrim()).CreateJointFrictionAttr(CASTER_ROLLING_FRICTION_NM)
 
-        wheel = UsdGeom.Cylinder.Define(stage, f"{prim_path}/Wheel{i}")
+        # Ball-caster-style sphere wheel (was a flat Cylinder) - a sphere has no "long axis" to
+        # look wrong as it rotates, so it reads correctly rolling in any direction regardless of
+        # which way CasterSwivel{i} has the fork pointed, unlike a cylinder which only looks right
+        # spinning about its own Y. UsdPhysics.CollisionAPI on a UsdGeom.Sphere uses an exact
+        # sphere collision approximation (no convexHull override needed, unlike the warehouse box
+        # props elsewhere in this file).
+        wheel = UsdGeom.Sphere.Define(stage, f"{prim_path}/Wheel{i}")
         wheel.CreateRadiusAttr(PUSHCART_WHEEL_RADIUS)
-        wheel.CreateHeightAttr(0.03)
-        wheel.CreateAxisAttr("Y")
         wheel.AddTranslateOp().Set(wheel_center)
         wheel.CreateDisplayColorAttr([(0.05, 0.05, 0.05)])
         UsdPhysics.CollisionAPI.Apply(wheel.GetPrim())
         UsdPhysics.RigidBodyAPI.Apply(wheel.GetPrim())
         UsdPhysics.MassAPI.Apply(wheel.GetPrim()).CreateMassAttr(PUSHCART_WHEEL_MASS)
 
+        # CasterSwivel{i} above (Z axis) and CasterSpin{i} here (Y axis) are both authored with no
+        # lower/upper limit attrs, which USD Physics treats as unlimited - i.e. both the fork's
+        # steering angle and the wheel's rolling spin already sweep the full 360deg, free-swiveling
+        # like a real caster. Nothing to change there; the sphere wheel above is what was actually
+        # missing for it to look right doing so from any fork heading.
         spin = UsdPhysics.RevoluteJoint.Define(stage, f"{prim_path}/CasterSpin{i}")
         spin.CreateBody0Rel().SetTargets([Sdf.Path(f"{prim_path}/CasterFork{i}")])
         spin.CreateBody1Rel().SetTargets([Sdf.Path(f"{prim_path}/Wheel{i}")])
@@ -994,7 +1020,7 @@ def build_pushcart(stage, prim_path: str, x: float, y: float, deck_riser_height:
         spin.CreateLocalPos1Attr().Set(Gf.Vec3f(0.0, 0.0, 0.0))
         PhysxSchema.PhysxJointAPI.Apply(spin.GetPrim()).CreateJointFrictionAttr(CASTER_ROLLING_FRICTION_NM)
 
-    post_x = -dx + 0.02
+    post_x = PUSHCART_HANDLE_SIDE_SIGN * (dx - 0.02)
     post_radius = 0.015
     handle_top_z = deck_top_z + PUSHCART_HANDLE_POST_HEIGHT
     for i, py in enumerate((-dy + post_radius, dy - post_radius)):
