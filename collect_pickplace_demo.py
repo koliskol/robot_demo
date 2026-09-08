@@ -444,6 +444,90 @@ def stiffen_gripper_friction(stage, robot_prim: str) -> None:
         )
 
 
+def dump_arm_joint_limits(stage, robot_prim: str) -> None:
+    """One-time diagnostic dump (not a fix) - print every arm joint's actual authored PhysX
+    revolute-joint limits and drive stiffness/damping, straight from the live asset, before this
+    file changes anything. Added after a pinch-the-handle-then-drive test drove left_arm_joint5/6
+    to 14.79/7.37 rad - several full rotations past any plausible limit - which raised a real
+    question this file has never actually checked: whether these joints have a PhysX rotation
+    limit enforced at all in THIS asset, as opposed to the separate offline reference URDF
+    (../Robot_project/urdf/galbot_g1_*_arm.urdf) that ARM_FORWARD_POSE/WRIST_ROTATE_MIN_RAD/etc.
+    were derived from - a USD asset's actual joint authoring doesn't have to match a
+    separately-generated URDF just because both describe the same robot. Call once, right after
+    add_reference_to_stage, before any of this file's own stiffen_*/hold_* joint modifications.
+    """
+    for prim in Usd.PrimRange(stage.GetPrimAtPath(robot_prim)):
+        path_str = str(prim.GetPath())
+        if "_arm_joint" not in path_str:
+            continue
+        joint = UsdPhysics.RevoluteJoint(prim)
+        if not joint:
+            continue
+        lower = joint.GetLowerLimitAttr().Get()
+        upper = joint.GetUpperLimitAttr().Get()
+        drive = UsdPhysics.DriveAPI.Get(prim, "angular")
+        stiffness = drive.GetStiffnessAttr().Get() if drive else None
+        damping = drive.GetDampingAttr().Get() if drive else None
+        print(f"[joint-limits] {path_str}: lower={lower} upper={upper} stiffness={stiffness} damping={damping}")
+
+
+# arm_joint5/6/7 (the wrist) are barely driven by this file's own control scheme - joint7 is
+# always commanded to 0 (nothing ever adds to that index), joint6 likewise, and joint5 (see
+# WRIST_ROTATE_JOINT_INDEX) only gets a modest fixed position target. Live-observed via the
+# watchdog (see GRIPPER_WATCHDOG_VELOCITY_RAD_S) during a pinch-the-handle-then-move test:
+# right_arm_joint7 reached +2.2657 rad - past its own documented hard limit of +-1.5382 rad - at
+# 3.19 rad/s, and right_arm_joint5 was dragged from its -0.74 rad target out to -1.756 rad at
+# -75 Nm of measured effort. This is the same class of problem already found and fixed once in
+# this file for the head joints (HEAD_JOINT_PATHS/stiffen_head_joints): a joint with weak native
+# PhysX drive stiffness holds its commanded position fine with no load, but gets shoved far off
+# target by a real external reaction force (here, from gripping the handle and then driving) that
+# the weak drive can't resist - the tight lead clamp on the *target* doesn't help, since it's the
+# *actual* position being dragged off course, not the target running ahead of it.
+WRIST_JOINT_STIFFNESS = 2000.0
+WRIST_JOINT_DAMPING = 200.0
+
+
+def stiffen_wrist_joints(stage, robot_prim: str) -> None:
+    """Raise arm_joint5/6/7's (both arms) PhysX drive stiffness/damping from their native
+    defaults, before the articulation is initialized - same technique and call-site timing as
+    stiffen_head_joints() above, applied to a different weak-drive joint group found via the
+    watchdog instead of the earlier head-wobble live test.
+
+    Discovers the actual joint prims by walking the live prim tree and matching path suffixes
+    (this file has never enumerated arm_joint5/6/7's own USD prim paths - only their DOF names,
+    used via robot.get_dof_index()) rather than a hardcoded guessed path, printing every prim it
+    stiffens so this can be checked live rather than trusted blind.
+
+    UNVERIFIED LIVE (no Isaac Sim available while writing this) - 2000/200 is a scaled-up guess
+    from stiffen_head_joints()'s live-tuned 200/20 (same 10:1 stiffness:damping ratio, scaled up
+    for the arm's larger mass/torques vs. the head), not itself live-tested. Re-run the exact
+    pinch-the-handle-then-move test that surfaced this and confirm the watchdog stays quiet;
+    raise further (same diminishing-returns pattern stiffen_head_joints() found - try roughly
+    10x before assuming it's not helping) if it still trips, or lower it if it introduces new
+    stiffness-related jitter/oscillation that wasn't there before.
+    """
+    keywords = ("left_arm_joint5", "left_arm_joint6", "left_arm_joint7", "right_arm_joint5", "right_arm_joint6", "right_arm_joint7")
+    stiffened_paths = []
+    for prim in Usd.PrimRange(stage.GetPrimAtPath(robot_prim)):
+        path_str = str(prim.GetPath())
+        if any(path_str.endswith(keyword) for keyword in keywords):
+            drive = UsdPhysics.DriveAPI.Get(prim, "angular")
+            drive.GetStiffnessAttr().Set(WRIST_JOINT_STIFFNESS)
+            drive.GetDampingAttr().Set(WRIST_JOINT_DAMPING)
+            stiffened_paths.append(path_str)
+
+    if stiffened_paths:
+        print(f"[wrist] stiffened {len(stiffened_paths)} joint(s) to {WRIST_JOINT_STIFFNESS}/{WRIST_JOINT_DAMPING}:")
+        for path in stiffened_paths:
+            print(f"    {path}")
+    else:
+        print(
+            "[warning] stiffen_wrist_joints matched no joint prims under "
+            f"{robot_prim!r} for keywords {keywords} - wrist stiffness NOT changed anywhere. "
+            "Check the actual arm_joint5/6/7 prim names live and adjust the keyword list."
+        )
+
+
 # The mount link's own local frame does not face the robot's forward direction - confirmed live
 # by rendering at identity orientation (showed a sideways, rolled view, not forward) and testing
 # candidate corrections: a +90deg rotation about local X (CAMERA_ROLL_DEG) is what re-aligns it,
@@ -717,6 +801,23 @@ GRIPPER_KEYS = {
 # shows any sign of the same instability, rather than assuming 0.02 is automatically safe just
 # because it's smaller than the proven-bad 0.3.
 GRIPPER_MAX_LEAD_RAD = 0.02
+
+# Live instability watchdog for the "hand keeps breaking when I pinch the handle and move" report -
+# no arm/gripper joint should ever move this fast during normal teleop (every jog control here is
+# lead-clamped to small per-step corrections), so a joint velocity above this is treated as a real
+# instability spike (the arm-flinging failure mode documented throughout this file), not ordinary
+# motion. 3.0 rad/s is a conservative guess, not measured against an actual observed fling event -
+# lower it if it doesn't trigger on a fling you can see happening, or raise it if normal fast
+# teleop motion false-triggers it.
+GRIPPER_WATCHDOG_VELOCITY_RAD_S = 3.0
+
+# How often to print the gripper-specific diagnostic (target vs. actual vs. velocity vs. effort)
+# while M/N is held or the gripper is off its target - see the print site below, added
+# specifically to trace "the hand breaks only when I pinch (grab) the pushcart handle": rather
+# than only reacting to a full watchdog-level spike, this gives a continuous trace of what the
+# gripper joint itself is doing throughout a grab, in case a problem shows up building up
+# gradually (e.g. tracking error growing) before ever crossing the spike threshold above.
+GRIPPER_DIAG_PERIOD_S = 0.2
 
 # Pushing the pushcart by its handle needs the pinch grip to transmit real push force without
 # slipping - the reported failure ("robot moves back, cart doesn't move, hand loses the grab") is
@@ -1313,8 +1414,18 @@ def main() -> None:
         target_top_z = table2_aabb[5]
 
     add_reference_to_stage(usd_path=assets_root_path + ROBOT_ASSET, prim_path=ROBOT_PRIM)
+    dump_arm_joint_limits(stage, ROBOT_PRIM)
     stiffen_head_joints()
     stiffen_gripper_friction(stage, ROBOT_PRIM)
+    # stiffen_wrist_joints(stage, ROBOT_PRIM) - DISABLED per live evidence, not just left
+    # unverified: a pinch-the-handle-then-drive test with this active showed spikes escalating
+    # within a single incident (-3.3 -> +7.2 -> -18.4 rad/s) and joint5/6 reaching multiple full
+    # rotations (14.79/7.37 rad), spreading to the whole arm and the other arm - worse than the
+    # isolated single-joint spikes seen before this was added, consistent with added stiffness
+    # feeding a growing oscillation rather than damping one out. Re-enable only after
+    # dump_arm_joint_limits' output is reviewed and a real root cause (very possibly: these joints
+    # have no enforced PhysX rotation limit at all in this asset, unlike the reference URDF) is
+    # understood - don't just try a different stiffness/damping number blind again.
     robot_spawn_x = table_aabb[0] - ROBOT_APPROACH_GAP_M
     robot_spawn_y = (table_center_y + target_y) / 2.0  # centered between table and the place-target
     place_on_ground(bbox_cache, ROBOT_PRIM, x=robot_spawn_x, y=robot_spawn_y)
@@ -1426,6 +1537,17 @@ def main() -> None:
     left_gripper_dof_indices = gripper_dof_indices(robot, "left")
     right_gripper_dof_indices = gripper_dof_indices(robot, "right")
     head_dof_indices = [robot.get_dof_index("head_joint1"), robot.get_dof_index("head_joint2")]
+
+    # For the live watchdog below - names kept in the exact same order as the indices they pair
+    # with (left_gripper_dof_indices/right_gripper_dof_indices are each a single drive-joint index,
+    # left_arm_dof_indices/right_arm_dof_indices are already joint1..joint7 order via
+    # arm_dof_indices()).
+    watchdog_names = (
+        ["left_gripper_joint", "right_gripper_joint"]
+        + [f"left_arm_joint{i}" for i in range(1, 8)]
+        + [f"right_arm_joint{i}" for i in range(1, 8)]
+    )
+    watchdog_dof_indices = left_gripper_dof_indices + right_gripper_dof_indices + left_arm_dof_indices + right_arm_dof_indices
 
     state_dof_indices = np.array(
         left_arm_dof_indices + right_arm_dof_indices + leg_indices + left_gripper_dof_indices + right_gripper_dof_indices
@@ -1570,6 +1692,14 @@ def main() -> None:
     print("  Arrow keys: rotate the camera (Left/Right pan, Up/Down tilt) - or use the browser's")
     print("  rotate buttons. Prints pan/tilt on release - paste into CAMERA_PAN_DEG/CAMERA_TILT_DEG.")
     print("  R resets (also discards an in-progress episode). Close the window to exit.")
+    print(
+        f"  [watchdog] active: prints full gripper/arm joint state if any joint exceeds "
+        f"{GRIPPER_WATCHDOG_VELOCITY_RAD_S} rad/s (a fling/instability event, not normal motion)."
+    )
+    print(
+        f"  [gripper] diagnostic active: while M/N is held, prints target/actual/lead/velocity/"
+        f"effort for both grippers every {GRIPPER_DIAG_PERIOD_S}s."
+    )
 
     physics_dt = world.get_physics_dt()
     record_period = 1.0 / args.record_fps
@@ -1577,6 +1707,8 @@ def main() -> None:
     consecutive_none_joint_frames = 0
     # Physics sim step rate (60Hz default) - used only to size the stuck-view bailout below.
     physics_hz = 1.0 / physics_dt
+    watchdog_tripped = False
+    gripper_diag_accum = 0.0
 
     while simulation_app.is_running():
         for cmd in frame_store.pop_commands():
@@ -1812,6 +1944,35 @@ def main() -> None:
             continue
         consecutive_none_joint_frames = 0
 
+        # Live instability watchdog (see GRIPPER_WATCHDOG_VELOCITY_RAD_S) - specifically added to
+        # help diagnose the "hand keeps breaking when I pinch the handle and move" report: dumps
+        # position/velocity/measured-effort for every gripper/arm joint the instant any of them
+        # spikes past a speed no normal teleop motion should ever reach, so the exact moment and
+        # which joint(s) are involved can be reported back rather than guessed from what's visible
+        # on screen. Wrapped in try/except since get_measured_joint_efforts() raises (not returns
+        # None) if the physics handle isn't valid - shouldn't happen this soon after the actual_q
+        # None-check above, but a diagnostic feature crashing the whole session would be worse than
+        # it silently skipping one frame.
+        try:
+            watchdog_qd = robot.get_joint_velocities(joint_indices=watchdog_dof_indices)
+            watchdog_effort = robot.get_measured_joint_efforts(joint_indices=watchdog_dof_indices)
+        except Exception:
+            watchdog_qd = None
+            watchdog_effort = None
+        if watchdog_qd is not None:
+            spike_mask = np.abs(watchdog_qd) > GRIPPER_WATCHDOG_VELOCITY_RAD_S
+            if np.any(spike_mask) and not watchdog_tripped:
+                watchdog_tripped = True
+                watchdog_pos = actual_q[watchdog_dof_indices]
+                print(f"[watchdog] INSTABILITY DETECTED - joint velocity exceeded {GRIPPER_WATCHDOG_VELOCITY_RAD_S} rad/s:")
+                for i, name in enumerate(watchdog_names):
+                    if spike_mask[i]:
+                        effort_str = f"{watchdog_effort[i]:+.4f}Nm" if watchdog_effort is not None else "n/a"
+                        print(f"    {name}: pos={watchdog_pos[i]:+.4f}rad vel={watchdog_qd[i]:+.4f}rad/s effort={effort_str}")
+            elif not np.any(spike_mask) and watchdog_tripped:
+                watchdog_tripped = False
+                print("[watchdog] cleared - joint velocities back to normal.")
+
         if args.rollout:
             # policy_action_vec is the last full 21-dim vector received from policy_server.py (see
             # the record_accum-gated query below) - None until the first prediction of an attempt
@@ -1922,6 +2083,29 @@ def main() -> None:
         right_gripper_q = clamp_to_actual(right_gripper_target, actual_q[right_gripper_dof_indices], max_lead=GRIPPER_MAX_LEAD_RAD)
         robot.apply_action(ArticulationAction(joint_positions=left_gripper_q, joint_indices=left_gripper_dof_indices))
         robot.apply_action(ArticulationAction(joint_positions=right_gripper_q, joint_indices=right_gripper_dof_indices))
+
+        # Gripper-specific diagnostic trace (see GRIPPER_DIAG_PERIOD_S) - only while M/N is
+        # actually held, at a fixed print rate rather than every physics step. watchdog_qd/
+        # watchdog_effort were already read this frame (see the watchdog block above) with
+        # left/right gripper as indices 0/1 of that same array - reused here rather than a second
+        # API call for the same data.
+        if not args.rollout and any(key in held_keys for key in GRIPPER_KEYS):
+            gripper_diag_accum += physics_dt
+            if gripper_diag_accum >= GRIPPER_DIAG_PERIOD_S:
+                gripper_diag_accum = 0.0
+                left_actual = float(actual_q[left_gripper_dof_indices[0]])
+                right_actual = float(actual_q[right_gripper_dof_indices[0]])
+                left_vel = float(watchdog_qd[0]) if watchdog_qd is not None else float("nan")
+                right_vel = float(watchdog_qd[1]) if watchdog_qd is not None else float("nan")
+                left_eff = float(watchdog_effort[0]) if watchdog_effort is not None else float("nan")
+                right_eff = float(watchdog_effort[1]) if watchdog_effort is not None else float("nan")
+                print(
+                    f"[gripper] target={gripper_rad:+.4f}rad  "
+                    f"L: actual={left_actual:+.4f} lead={gripper_rad - left_actual:+.4f} vel={left_vel:+.4f}rad/s effort={left_eff:+.4f}Nm  "
+                    f"R: actual={right_actual:+.4f} lead={gripper_rad - right_actual:+.4f} vel={right_vel:+.4f}rad/s effort={right_eff:+.4f}Nm"
+                )
+        else:
+            gripper_diag_accum = 0.0
 
         camera_rotation_changed = False
         for key in held_keys:
