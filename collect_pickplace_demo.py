@@ -1771,6 +1771,10 @@ def main() -> None:
     # pickup_policy/place_policy's existing (pre-2026-09-08, always-joint5=0) data can match that
     # starting pose instead of silently drifting onto the newer calibrated default.
     starting_wrist_x_rad = args.starting_wrist_x_rad if args.starting_wrist_x_rad is not None else STARTING_WRIST_X_RAD
+    print(
+        f"[wrist] starting_wrist_x_rad={starting_wrist_x_rad:+.4f}rad "
+        f"({'--starting-wrist-x-rad override' if args.starting_wrist_x_rad is not None else 'default STARTING_WRIST_X_RAD'})"
+    )
 
     left_arm_swing_rate = arm_swing_rate("left", args.arm_speed)
     right_arm_swing_rate = arm_swing_rate("right", args.arm_speed)
