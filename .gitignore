@@ -13,3 +13,5 @@ lerobot_dataset_place/
 gr00t_datasets/
 act_training/
 rollout_episodes/
+gr00t_model_trained/
+*.log
