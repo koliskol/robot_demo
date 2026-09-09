@@ -1058,6 +1058,26 @@ def arm_swing_rate(side: str, arm_speed: float) -> float:
     return arm_speed / float(delta)
 
 
+def idle_arm_pose(starting_wrist_x_rad: float) -> tuple:
+    """The settle-into pose used only at launch/reset - see run_policy_inference.py's identical
+    helper (ported here, same derivation from STARTING_*-fraction and wrist offsets)."""
+    left = (1.0 - STARTING_LEFT_ARM_SWING_FRACTION) * np.array(ARM_OPEN_POSE["left"]) + STARTING_LEFT_ARM_SWING_FRACTION * np.array(
+        ARM_FORWARD_POSE["left"]
+    )
+    right = (1.0 - STARTING_RIGHT_ARM_SWING_FRACTION) * np.array(
+        ARM_OPEN_POSE["right"]
+    ) + STARTING_RIGHT_ARM_SWING_FRACTION * np.array(ARM_FORWARD_POSE["right"])
+    left[ARM_HAND_UPDOWN_JOINT_INDEX] += STARTING_HAND_UPDOWN_RAD
+    right[ARM_HAND_UPDOWN_JOINT_INDEX] += STARTING_HAND_UPDOWN_RAD
+    left[WRIST_X_JOINT_INDEX] += starting_wrist_x_rad
+    right[WRIST_X_JOINT_INDEX] += starting_wrist_x_rad
+    left[WRIST_Y_JOINT_INDEX] += STARTING_WRIST_Y_RAD
+    right[WRIST_Y_JOINT_INDEX] += STARTING_WRIST_Y_RAD
+    left[WRIST_Z_JOINT_INDEX] += STARTING_WRIST_Z_RAD
+    right[WRIST_Z_JOINT_INDEX] += STARTING_WRIST_Z_RAD
+    return left, right
+
+
 def clamp_to_actual(target: np.ndarray, actual: np.ndarray, max_lead: float = MAX_JOINT_LEAD_RAD) -> np.ndarray:
     return np.clip(target, actual - max_lead, actual + max_lead)
 
@@ -1776,6 +1796,22 @@ def main() -> None:
         f"({'--starting-wrist-x-rad override' if args.starting_wrist_x_rad is not None else 'default STARTING_WRIST_X_RAD'})"
     )
 
+    # --rollout only: held_* persist across frames and are only overwritten while a fresh
+    # prediction is arriving (see the main loop below) - deactivating a policy (M/N toggle-off, or
+    # B) simply stops updating them, freezing the arms/torso/grippers wherever they were instead of
+    # snapping back to the settle pose. Ported from run_policy_inference.py, which solved this
+    # exact problem first (see its own held_* comment) - collect_pickplace_demo.py's earlier fix
+    # attempt keyed off recorder_state instead and was strictly worse: it still needed a
+    # settle-pose special case for the very first prediction of each attempt, whereas this way that
+    # falls out for free (held_* already equals the settle pose from init/reset until the first
+    # real prediction overwrites it). Only used as the actual starting values here, at launch,
+    # before any policy has ever activated - the R-reset handler below re-initializes them the same
+    # way, matching a real world.reset().
+    held_left_arm_q, held_right_arm_q = idle_arm_pose(starting_wrist_x_rad)
+    held_torso_q = np.array(TORSO_UP_POSE)
+    held_left_gripper_target = np.array([0.0])
+    held_right_gripper_target = np.array([0.0])
+
     left_arm_swing_rate = arm_swing_rate("left", args.arm_speed)
     right_arm_swing_rate = arm_swing_rate("right", args.arm_speed)
     left_arm_swing_fraction = STARTING_LEFT_ARM_SWING_FRACTION
@@ -2006,6 +2042,10 @@ def main() -> None:
             episode_forward_dir = None
             if args.rollout:
                 policy_action_vec = None
+                held_left_arm_q, held_right_arm_q = idle_arm_pose(starting_wrist_x_rad)
+                held_torso_q = np.array(TORSO_UP_POSE)
+                held_left_gripper_target = np.array([0.0])
+                held_right_gripper_target = np.array([0.0])
             continue
 
         if activate_pickup_requested:
@@ -2203,48 +2243,21 @@ def main() -> None:
                 print(f"[compliance] {label} cleared - back to normal control.")
 
         if args.rollout:
-            # policy_action_vec is the last full 21-dim vector received from policy_server.py (see
-            # the record_accum-gated query below) - None until the first prediction of an attempt
-            # arrives, during which the arms hold the exact same STARTING_*-fraction pose teleop
-            # mode's held_keys loop initializes left_arm_swing_fraction/right_arm_swing_fraction/
-            # hand_updown_rad to (NOT the fully-open pose - that's a materially different, more
-            # retracted pose, and defaulting to it here made the robot look frozen at launch since
-            # it's close to the raw spawn pose, with none of the visible ~5s settle-into-position
-            # motion teleop mode shows).
-            #
-            # AWAITING_LABEL (the window between stopping and pressing Y/F/Backspace) is a
-            # DIFFERENT case from "no prediction yet" and must not fall into that same settle-pose
-            # branch: every stop path (B, and M/N's own toggle-off) sets policy_action_vec = None
-            # specifically to release the chassis_forward override below, and this arm/torso/
-            # gripper logic used to key off that same None - so pressing M to stop an attempt made
-            # the arms swing back toward the settle pose and the grippers snap open immediately
-            # (dropping whatever was held), instead of freezing in place so the outcome can
-            # actually be seen before labeling it. Deliberately checked as AWAITING_LABEL
-            # specifically, not "not RECORDING" generally - IDLE also means "not RECORDING" (both
-            # at initial launch and after a label/reset), where the settle-pose fallback below is
-            # still the right, intended behavior; an earlier version of this fix used "not
-            # RECORDING" and broke the launch settle animation as a result.
-            if recorder_state is RecorderState.AWAITING_LABEL:
-                left_arm_q = actual_q[left_arm_dof_indices].copy()
-                right_arm_q = actual_q[right_arm_dof_indices].copy()
-            elif policy_action_vec is not None:
-                left_arm_q = policy_action_vec[0:7].copy()
-                right_arm_q = policy_action_vec[7:14].copy()
-            else:
-                left_arm_q = (1.0 - STARTING_LEFT_ARM_SWING_FRACTION) * np.array(
-                    ARM_OPEN_POSE["left"]
-                ) + STARTING_LEFT_ARM_SWING_FRACTION * np.array(ARM_FORWARD_POSE["left"])
-                right_arm_q = (1.0 - STARTING_RIGHT_ARM_SWING_FRACTION) * np.array(
-                    ARM_OPEN_POSE["right"]
-                ) + STARTING_RIGHT_ARM_SWING_FRACTION * np.array(ARM_FORWARD_POSE["right"])
-                left_arm_q[ARM_HAND_UPDOWN_JOINT_INDEX] += STARTING_HAND_UPDOWN_RAD
-                right_arm_q[ARM_HAND_UPDOWN_JOINT_INDEX] += STARTING_HAND_UPDOWN_RAD
-                left_arm_q[WRIST_X_JOINT_INDEX] += starting_wrist_x_rad
-                right_arm_q[WRIST_X_JOINT_INDEX] += starting_wrist_x_rad
-                left_arm_q[WRIST_Y_JOINT_INDEX] += STARTING_WRIST_Y_RAD
-                right_arm_q[WRIST_Y_JOINT_INDEX] += STARTING_WRIST_Y_RAD
-                left_arm_q[WRIST_Z_JOINT_INDEX] += STARTING_WRIST_Z_RAD
-                right_arm_q[WRIST_Z_JOINT_INDEX] += STARTING_WRIST_Z_RAD
+            # held_left_arm_q/held_right_arm_q only get overwritten below when a fresh prediction
+            # has actually arrived (policy_action_vec is not None) - ported from
+            # run_policy_inference.py, which solved this exact "deactivating snaps back to the
+            # settle pose and drops whatever was held" problem first (see its own held_* comment
+            # near where these are declared, and this file's matching declaration above). Stopping
+            # (B, or M/N's toggle-off) sets policy_action_vec = None to release the
+            # chassis_forward override further below, but that no longer touches held_* at all, so
+            # the arms simply stay wherever they were - no separate AWAITING_LABEL/IDLE distinction
+            # needed, and the settle pose (held_*'s init/reset value) still naturally applies
+            # before the first prediction of a fresh attempt, since nothing has overwritten it yet.
+            if policy_action_vec is not None:
+                held_left_arm_q = policy_action_vec[0:7].copy()
+                held_right_arm_q = policy_action_vec[7:14].copy()
+            left_arm_q = held_left_arm_q
+            right_arm_q = held_right_arm_q
         else:
             # Compliance: block only the FORWARD (U, direction>0 - toward ARM_FORWARD_POSE, i.e.
             # further into whatever it's pressed against) increment on a side whose own joint2 is
@@ -2342,11 +2355,10 @@ def main() -> None:
         robot.apply_action(ArticulationAction(joint_positions=right_arm_q, joint_indices=right_arm_dof_indices))
 
         if args.rollout:
-            # Same AWAITING_LABEL-holds-at-actual reasoning as the arms above.
-            if recorder_state is RecorderState.AWAITING_LABEL:
-                torso_q = actual_q[leg_indices].copy()
-            else:
-                torso_q = policy_action_vec[14:19].copy() if policy_action_vec is not None else np.array(TORSO_UP_POSE)
+            # Same held_*-only-updates-on-a-fresh-prediction reasoning as the arms above.
+            if policy_action_vec is not None:
+                held_torso_q = policy_action_vec[14:19].copy()
+            torso_q = held_torso_q
         else:
             for key in held_keys:
                 if key in TORSO_HEIGHT_KEYS:
@@ -2357,19 +2369,16 @@ def main() -> None:
         robot.apply_action(ArticulationAction(joint_positions=torso_q, joint_indices=leg_indices))
 
         if args.rollout:
-            # Same AWAITING_LABEL-holds-at-actual reasoning as the arms above - critically, this is
-            # what stops a stop (B, or M/N's toggle-off) from snapping the grippers open and
-            # dropping whatever was being held, which they'd otherwise do since the old "no
-            # prediction yet" fallback here was np.array([0.0]) (fully open).
-            if recorder_state is RecorderState.AWAITING_LABEL:
-                left_gripper_target = actual_q[left_gripper_dof_indices].copy()
-                right_gripper_target = actual_q[right_gripper_dof_indices].copy()
-            elif policy_action_vec is not None:
-                left_gripper_target = policy_action_vec[19:20].copy()
-                right_gripper_target = policy_action_vec[20:21].copy()
-            else:
-                left_gripper_target = np.array([0.0])
-                right_gripper_target = np.array([0.0])
+            # Same held_*-only-updates-on-a-fresh-prediction reasoning as the arms above -
+            # critically, this is what stops a stop (B, or M/N's toggle-off) from snapping the
+            # grippers open and dropping whatever was being held, which they used to do since the
+            # old "no prediction yet" fallback here was np.array([0.0]) (fully open) and applied
+            # on every stop too, not just before an attempt's first prediction.
+            if policy_action_vec is not None:
+                held_left_gripper_target = policy_action_vec[19:20].copy()
+                held_right_gripper_target = policy_action_vec[20:21].copy()
+            left_gripper_target = held_left_gripper_target
+            right_gripper_target = held_right_gripper_target
         else:
             for key in held_keys:
                 if key in GRIPPER_KEYS:
