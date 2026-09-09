@@ -718,3 +718,80 @@ CUDA_VISIBLE_DEVICES=0 uv run python gr00t/experiment/launch_finetune.py \
     --save-steps 2000 --max-steps 2000 --global-batch-size 32
 ```
 (swap `pickup_policy` for `place_policy` for the other one - two separate fine-tunes, same as ACT).
+
+**A `pickup_policy` checkpoint came back from the H200 (`gr00t_model_trained/`, safetensors + a
+`gr00t_model.zip` of config/processor files) and local GR00T inference has now been confirmed to
+actually work on this machine's RTX 4080 Laptop (12GB)** - not just theorized about, unlike
+everything else in this section up to now. Checkpoint's `config.json` declares
+`"architectures": ["Gr00tN1d6"]` (GR00T N1.6, not N1.7) and `dataset_statistics.json` confirms the
+22-dim `chassis_forward`-inclusive schema, so this is current-format data, not a stale 21-dim run.
+
+**Getting a loadable environment took real, non-obvious work - each step here was a genuine
+blocker, not a formality**:
+- `/home/kholis/Isaac-GR00T-main` referenced elsewhere in this doc didn't exist on this machine at
+  all (training only ever ran on the H200) - re-cloned from `github.com/NVIDIA/Isaac-GR00T`.
+- **The repo's `main` branch has moved on to N1.7-only and can't load this checkpoint** -
+  `gr00t/model/` only contains `gr00t_n1d7/`, and `MODEL_REGISTRY` has nothing registered for
+  `"Gr00tN1d6"`, confirmed by reading `gr00t/model/registry.py` directly rather than guessing from
+  an import error. Fixed by checking out the `n1.6-release` git tag (found via `git fetch
+  --unshallow`, which also revealed `n1.5-release`/`n1.7-release` tags) - that tag's `gr00t/model/`
+  still has `gr00t_n1d6/`, matching the checkpoint exactly. Any future GR00T checkpoint made against
+  a different model version needs its own matching tag, not whatever `main` happens to be.
+- New `gr00t_infer` conda env, Python 3.10 (matches the `n1.6-release` `pyproject.toml`'s
+  `>=3.10,<3.13` and its prebuilt `flash-attn` wheel's `cp310` tag) - kept separate from
+  `isaac_sim`/`lerobot` for the same dependency-conflict reasoning already established for those
+  two, just with a heavier stack (a ~2B-param Eagle VLM backbone, flash-attn).
+- Installed `torch==2.7.1`/`torchvision==0.22.1` from the `cu128` PyTorch index and the rest of
+  that tag's pinned runtime deps via plain `pip`, then `pip install -e . --no-deps` for the `gr00t`
+  package itself - skipping the full `pyproject.toml` dependency list on purpose
+  (`deepspeed`/`tensorrt`/`onnx` are training/export-only weight, not needed to just call
+  `get_action()`, and risk being slow or failing to build in a plain pip install with no matching
+  system CUDA toolkit).
+- **`flash_attn` turned out to be a hard requirement despite looking optional** - the Eagle
+  backbone's own `modeling_siglip2.py` only imports it behind `is_flash_attn_2_available()`, but
+  loading the checkpoint still raised `ImportError: FlashAttention2 has been toggled on` from deep
+  inside `transformers`' own `_autoset_attn_implementation` - confirmed live, not assumed from
+  reading the code alone. Fixed by installing the exact prebuilt wheel `n1.6-release`'s
+  `pyproject.toml` names for `cp310`/`torch2.7`/`cu12`/`x86_64`
+  (`flash_attn-2.7.4.post1+cu12torch2.7cxx11abiFALSE-cp310-cp310-linux_x86_64.whl` from the
+  `Dao-AILab/flash-attention` GitHub releases) rather than `pip install flash-attn`, which compiles
+  from source and can take a very long time (or fail) without a matching CUDA toolkit installed.
+- **The checkpoint directory `gr00t_model.zip` unpacks to isn't directly loadable** -
+  `Gr00tN1d6Processor.from_pretrained` (confirmed by reading it directly) looks for
+  `processor_config.json`/`statistics.json`/`embodiment_id.json` at the top level of the model
+  directory, but the zip nests them under a `processor/` subfolder. Fixed by assembling
+  `gr00t_model_trained/pickup_policy_ckpt/` with those three files copied up to the top level
+  alongside `config.json`/`model.safetensors.index.json` (from the zip) and the two
+  `model-*-of-00002.safetensors` shards symlinked in from the parent directory (avoids duplicating
+  9.8GB) - `AutoModel.from_pretrained`/`AutoProcessor.from_pretrained` both load cleanly from that
+  assembled directory. Any other checkpoint pulled from the H200 the same way will need the same
+  flattening.
+
+**Confirmed live, with real numbers, not estimated**: loading the checkpoint onto `cuda:0` in
+bf16 and running one `get_action()` call used **6.6-6.9GB of the 12GB card** - comfortably inside
+budget, and notably less than the 9.81GB raw weight size implied by `model.safetensors.index.json`
+(the fp32-upcast top-4 LLM layers `tune_top_llm_layers` keeps trainable don't change this enough to
+matter here since this is inference, not training). This is a materially better result than the
+"barely fits, unverified" concern this doc raised before an actual `gr00t_infer` env existed to
+test it. Per-call latency, measured over several calls after the first (warmup) one: **~85-95ms**,
+versus the ACT checkpoint's confirmed ~8-9ms and the 67ms/15Hz budget `--rollout`'s control loop
+targets - a real, confirmed gap (roughly 11Hz achievable, not 15Hz), though not necessarily fatal
+since the rollout loop already re-applies the last received target between predicts rather than
+blocking on one every physics step (see the ACT `--rollout` section above) - untested whether
+tracking quality actually holds up at that effective rate, only that it runs.
+
+**`gr00t_policy_server.py`** is a drop-in alternative to `policy_server.py` for
+`collect_pickplace_demo.py --rollout` - it speaks the identical `policy_wire.py` protocol
+(`PolicyClient.reset()`/`predict()` don't know or care which model answers), so no changes to
+`collect_pickplace_demo.py` were needed; point `--policy-host`/`--policy-port` at it instead of an
+ACT server. It builds the `video`/`state`/`language` observation dict `Gr00tPolicy.get_action()`
+expects (confirmed against the checkpoint's own `processor_config.json`, which stores the exact
+per-key modality breakdown from training) and returns only the predicted chunk's first timestep
+(`action_horizon=16` per call, unlike ACT's own internal one-step dequeue) - it does not attempt to
+consume or cache the remaining 15 steps. **Verified live end-to-end**: `policy_client.py`, imported
+from the `isaac_sim` env exactly as `collect_pickplace_demo.py` would, connected, reset, and ran
+several `predict()` calls against a running `gr00t_policy_server.py`, returning finite `(22,)`
+`float32` vectors at the latency above - with a synthetic random image and zeroed state, not a real
+Isaac Sim scene. **Not yet attempted**: an actual closed-loop rollout inside Isaac Sim itself (the
+`--rollout` flag pointed at this server) - that's the next real test, same caveat this doc already
+applies to the ACT rollout path.
