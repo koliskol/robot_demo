@@ -2211,7 +2211,19 @@ def main() -> None:
             # retracted pose, and defaulting to it here made the robot look frozen at launch since
             # it's close to the raw spawn pose, with none of the visible ~5s settle-into-position
             # motion teleop mode shows).
-            if policy_action_vec is not None:
+            #
+            # recorder_state is not RECORDING (IDLE/AWAITING_LABEL) is a DIFFERENT case from "no
+            # prediction yet" and must not fall into that same settle-pose branch: every stop path
+            # (B, and M/N's own toggle-off) sets policy_action_vec = None specifically to release
+            # the chassis_forward override below, and this arm/torso/gripper logic used to key off
+            # that same None - so pressing M to stop an attempt made the arms swing back toward the
+            # settle pose and the grippers snap open immediately (dropping whatever was held),
+            # instead of freezing in place the way "stop" should. Hold at actual position whenever
+            # not RECORDING, regardless of policy_action_vec.
+            if recorder_state is not RecorderState.RECORDING:
+                left_arm_q = actual_q[left_arm_dof_indices].copy()
+                right_arm_q = actual_q[right_arm_dof_indices].copy()
+            elif policy_action_vec is not None:
                 left_arm_q = policy_action_vec[0:7].copy()
                 right_arm_q = policy_action_vec[7:14].copy()
             else:
@@ -2326,7 +2338,11 @@ def main() -> None:
         robot.apply_action(ArticulationAction(joint_positions=right_arm_q, joint_indices=right_arm_dof_indices))
 
         if args.rollout:
-            torso_q = policy_action_vec[14:19].copy() if policy_action_vec is not None else np.array(TORSO_UP_POSE)
+            # Same not-RECORDING-holds-at-actual reasoning as the arms above.
+            if recorder_state is not RecorderState.RECORDING:
+                torso_q = actual_q[leg_indices].copy()
+            else:
+                torso_q = policy_action_vec[14:19].copy() if policy_action_vec is not None else np.array(TORSO_UP_POSE)
         else:
             for key in held_keys:
                 if key in TORSO_HEIGHT_KEYS:
@@ -2337,7 +2353,14 @@ def main() -> None:
         robot.apply_action(ArticulationAction(joint_positions=torso_q, joint_indices=leg_indices))
 
         if args.rollout:
-            if policy_action_vec is not None:
+            # Same not-RECORDING-holds-at-actual reasoning as the arms above - critically, this is
+            # what stops a stop (B, or M/N's toggle-off) from snapping the grippers open and
+            # dropping whatever was being held, which they'd otherwise do since the old "no
+            # prediction yet" fallback here was np.array([0.0]) (fully open).
+            if recorder_state is not RecorderState.RECORDING:
+                left_gripper_target = actual_q[left_gripper_dof_indices].copy()
+                right_gripper_target = actual_q[right_gripper_dof_indices].copy()
+            elif policy_action_vec is not None:
                 left_gripper_target = policy_action_vec[19:20].copy()
                 right_gripper_target = policy_action_vec[20:21].copy()
             else:
