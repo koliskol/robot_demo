@@ -795,3 +795,41 @@ several `predict()` calls against a running `gr00t_policy_server.py`, returning 
 Isaac Sim scene. **Not yet attempted**: an actual closed-loop rollout inside Isaac Sim itself (the
 `--rollout` flag pointed at this server) - that's the next real test, same caveat this doc already
 applies to the ACT rollout path.
+
+## SmolVLA - fine-tuning (not just inference) confirmed live on this machine
+
+Separately from GR00T, `lerobot[smolvla]==0.4.4` (installed into the existing `lerobot` conda env
+via `pip install "lerobot[smolvla]==0.4.4"`, which pulls in `transformers` and the other smolvla
+extras that plain `lerobot` doesn't include) was used to actually run `lerobot-train
+--policy.type=smolvla --policy.pretrained_path=lerobot/smolvla_base` against
+`lerobot_dataset_pickup` (the same v3.0 dataset `convert_to_lerobot.py` already produces for ACT) -
+a real fine-tuning run, not inference. Two CLI gotchas hit before it ran: the output dir must not
+already exist unless `--resume=true`, and `--policy.repo_id`/`--policy.push_to_hub=false` are
+required even for a fully local run (the validator errors without them, despite nothing actually
+being pushed to the Hub).
+
+**Confirmed live: loss actually decreases with real gradient updates** (10-step run: 2.29 -> 0.83,
+noisy but trending down, batch size 4) - this is a genuine fine-tuning step, not just a forward
+pass. `num_learnable_params=99.88M` out of `num_total_params=450M` printed at start, confirming
+SmolVLA's own defaults (`freeze_vision_encoder=True`, `train_expert_only=True`) are what's actually
+running - only the ~100M-param action expert trains, the SmolVLM2-500M-Video-Instruct backbone
+stays frozen.
+
+**Peak VRAM measured at batch_size=8 over a real 300-step run (1-second `nvidia-smi` polling for
+the full ~70s duration, not a single snapshot): ~3.0GB** - dramatically better than the
+~10-16GB LeRobot's own `hardware_guide.mdx` states for this exact tier/batch size. Not fully
+reconciled why the gap is this large (possibly that guide's number assumes something this
+default-settings run doesn't - a different effective batch via gradient accumulation, an unfrozen
+backbone, or eval/logging overhead) - flagging the discrepancy rather than picking one explanation,
+since both numbers came from a stated source (the doc) vs. a real local measurement (this run), and
+only the second was actually observed on this machine. Either way, **this is comfortably inside the
+12GB budget with a lot of room to spare** - unlike GR00T, where two 3B+-class checkpoints don't fit
+together, batch_size=8 SmolVLA training leaves enough headroom that raising the batch size further,
+or eventually running training alongside something else, is plausible (untested how far).
+
+The one-time `lerobot/smolvla_base` pretrained checkpoint download (907MB, cached under
+`~/.cache/huggingface/hub/models--lerobot--smolvla_base`) only needs to happen once - reused across
+runs. Test checkpoints from these verification runs were written to a scratch directory and deleted
+afterward, not kept - a real fine-tuning session should pick a real `--output_dir` under this repo
+(gitignored, same as `act_training/`) and a realistic `--steps` count, not the 10/300-step smoke
+tests used here to confirm the mechanism works.
