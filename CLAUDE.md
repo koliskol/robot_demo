@@ -853,3 +853,33 @@ checkpoint's real pick/place behavior - either open-loop against held-out frames
 `collect_pickplace_demo.py --rollout`. A low final loss here says the model fits its own training
 distribution, not that it can actually control the robot - same caveat this doc already applies to
 every other checkpoint before its first real rollout.
+
+**Closed-loop rollout now attempted live, and it actually works.** No new server was needed -
+`policy_server.py`/`lerobot_policy_utils.py` (originally built for ACT) turned out to already be
+policy-agnostic: `PreTrainedConfig.from_pretrained()` reads the policy type straight from the
+checkpoint's own `config.json` and `make_policy()`/`make_pre_post_processors()` dispatch on it, so
+pointing `policy_server.py --checkpoint-dir` at the SmolVLA checkpoint just worked, unmodified.
+Confirmed live: ~1.5GB VRAM for inference (lighter than training's ~3GB, no gradients/optimizer
+state) and ~10-13ms per `predict()` call after warmup - dramatically faster than GR00T's ~85-95ms,
+comfortably inside the 67ms/15Hz `--rollout` budget with room to spare.
+
+**User-confirmed result from the first live watched session**: pressing `M` in the Isaac Sim
+window activates the SmolVLA `pickup_policy` checkpoint, and **it can actually grab both the
+medium and big boxes** - the central open risk this whole pipeline has carried since
+`capture_cube_rgbd.py` (actually lifting a loose object, not just pinching a fixed obstacle) is
+resolved for this checkpoint, at least for the cube-scale-cycle boxes tested. Not yet confirmed:
+whether it holds up across the box-jitter range, whether it succeeds reliably vs. sometimes, or
+whether the small box also works - only stated as "it works" from watching it grab two of the
+three sizes.
+
+**Real usability gap found and fixed**: none of these policies (SmolVLA, ACT, GR00T) predict any
+kind of "done"/termination signal - they're pure behavior-cloning, trained only on "given this
+observation, what's the next action," with episode boundaries decided entirely by whoever was
+pressing keys during data collection. So a running `--rollout` attempt predicts forever with no
+natural stopping point; the *only* way it stops is a human pressing `B`/`Y`/`F`/`Backspace`, which
+is easy to not realize since `M`/`N` are the buttons actually used to start it. Fixed by making
+`M`/`N` toggle: pressing the same key again while that policy is the one currently running now
+stops the attempt (the same transition `B` triggers) so `Y`/`F`/`Backspace` can label it; pressing
+the *other* key while one is running still just switches the active policy without stopping,
+unchanged. This applies to all three policy types equally, since the toggle lives in
+`collect_pickplace_demo.py`'s key handler, not in anything policy-specific.
