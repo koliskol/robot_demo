@@ -884,6 +884,40 @@ be training-data imbalance (if small-box episodes were under-represented in the 
 dataset), the smaller visual/contact margin making the hug's compression window narrower, or
 something else; not distinguished yet.
 
+**`place_policy` (SmolVLA) has now been fine-tuned the same way, on the already-recorded/already-
+converted `raw_place`/`lerobot_dataset_place` data (50/50 success-labeled episodes, 11,775 frames,
+22-dim schema - this data predates this session and just hadn't been trained on yet).** Same
+command shape as `pickup_policy`'s run (`--policy.type=smolvla
+--policy.pretrained_path=lerobot/smolvla_base`, `batch_size=8`, `steps=20000`,
+`save_freq=4000`), output to `smolvla_training/place_policy/`. Took **~82 minutes wall-clock**
+(15:43-17:05), ~4.0-4.1 steps/s sustained, matching `pickup_policy`'s throughput on this GPU.
+Loss trend across the run (single-batch instantaneous value at each checkpoint, not an averaged
+epoch loss - noisy by nature): `step 4K: 0.107 -> step 8K: 0.066 -> step 12K: 0.038 -> step 16K:
+0.031 -> step 20K: 0.040`. Note this is not monotonic at the tail (16K's single-sample reading is
+lower than 20K's) - consistent with the same "converges hard early, then plateaus/noises in the
+0.03-0.04 band" pattern `pickup_policy` showed, not evidence that 16K is actually the better
+checkpoint. Kept the **final step-20000 checkpoint** as the one to carry forward (`checkpoints/020000`,
+symlinked as `checkpoints/last`) rather than picking whichever single noisy reading happened to be
+lowest - it's the only checkpoint saved after the cosine learning-rate schedule had annealed
+nearly to zero (`lr:2.5e-06` at 20K vs `9.1e-05` at 4K), which is the principled reason to prefer
+it over an earlier one absent a real held-out-eval signal to rank them by. Trimmed the four
+intermediate checkpoints (4K/8K/12K/16K, ~6GB) immediately after, same as `pickup_policy` was
+eventually trimmed to just its final checkpoint - disk was at 92%/21GB free right after the run
+finished, tight enough that keeping every checkpoint from a future training run isn't viable
+without trimming as you go.
+
+**Not yet done, deliberately deferred to the next session**: any evaluation of this checkpoint at
+all - no open-loop check, no closed-loop `--rollout` test. Exactly the same caveat this doc already
+applies to every other checkpoint before its first real test: a low training loss says the model
+fits its own training distribution, not that it can actually place a held box onto the target
+successfully. The closed-loop path is already proven end-to-end for `pickup_policy`
+(`policy_server.py` is policy-agnostic, reads the type from the checkpoint's own `config.json`), so
+testing `place_policy` should just mean pointing `policy_server.py --checkpoint-dir` at
+`smolvla_training/place_policy/checkpoints/020000/pretrained_model` and running
+`collect_pickplace_demo.py --rollout` with `N` (place is the second slot, mirroring `M` for
+pickup) - starting from a manually-jogged "already holding the box" pose, per how `place_policy`
+episodes were always recorded (see the two-policy plan above).
+
 **Real usability gap found and fixed**: none of these policies (SmolVLA, ACT, GR00T) predict any
 kind of "done"/termination signal - they're pure behavior-cloning, trained only on "given this
 observation, what's the next action," with episode boundaries decided entirely by whoever was
