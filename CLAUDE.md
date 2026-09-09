@@ -833,3 +833,23 @@ runs. Test checkpoints from these verification runs were written to a scratch di
 afterward, not kept - a real fine-tuning session should pick a real `--output_dir` under this repo
 (gitignored, same as `act_training/`) and a realistic `--steps` count, not the 10/300-step smoke
 tests used here to confirm the mechanism works.
+
+**A real 20,000-step fine-tune (matching the GR00T H200 run's step count, for comparability) has
+now been run end-to-end**: `smolvla_training/pickup_policy/`, same `lerobot_dataset_pickup` data,
+batch_size=8, checkpoints every 4000 steps. Took **77 minutes wall-clock** on this GPU (~4.3
+steps/s sustained, matching the earlier smoke test's throughput) - VRAM stayed flat at the same
+~3GB the shorter run showed, no growth over the full run. Loss trend across the run: `step 200:
+1.156 -> step 5K: 0.076 -> step 10K: 0.046 -> step 15K: 0.033 -> step 20K: 0.038` - converges hard
+by ~5-10K steps (roughly epoch 2-4 over this 71-episode dataset) and mostly plateaus/noises around
+0.03-0.04 after, suggesting 20K steps is already past the point of obviously-still-improving returns
+for a dataset this size, not that more steps are clearly needed. Final checkpoint:
+`smolvla_training/pickup_policy/checkpoints/020000/pretrained_model` (also symlinked as
+`checkpoints/last`). Five checkpoints (4K/8K/12K/16K/20K) total ~7.5GB on disk - **not yet trimmed
+down to just the final one**, worth deleting the intermediate four if disk space matters (this
+machine was at ~91% full/23GB free right after this run). **Not yet done**: actually evaluating this
+checkpoint's real pick/place behavior - either open-loop against held-out frames
+(`evaluate_act_checkpoint.py`'s pattern, not yet ported to SmolVLA) or closed-loop via a
+`smolvla`-serving equivalent of `gr00t_policy_server.py`/`policy_server.py` through
+`collect_pickplace_demo.py --rollout`. A low final loss here says the model fits its own training
+distribution, not that it can actually control the robot - same caveat this doc already applies to
+every other checkpoint before its first real rollout.
