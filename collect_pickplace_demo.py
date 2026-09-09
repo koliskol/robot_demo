@@ -32,8 +32,14 @@ stream_demo.py/../Robot_project/capture_cube_rgbd.py:
                 In --rollout mode, grippers are policy-controlled instead, so M/N are repurposed:
                 press M to activate the pickup policy (--policy-host/--policy-port, task=--task),
                 press N to activate the place policy (--policy2-host/--policy2-port, task=--task2).
-                Two separate policy_server.py processes must be running, one per checkpoint/port.
-                Switching resets the newly-activated policy's internal action-chunk queue.
+                Each also toggles: pressing the same key again while that policy is the one
+                currently running stops the attempt (same transition as B) so it can be labeled
+                with Y/F/Backspace - there is no learned "done" signal, the policy predicts actions
+                forever otherwise, so this is the only way to end an attempt. Pressing the *other*
+                key while one is already running just switches which policy is active without
+                stopping the recording. Two separate policy_server.py processes must be running,
+                one per checkpoint/port. Switching or restarting resets the newly-activated
+                policy's internal action-chunk queue.
     C / V       hold to rotate both wrists on joint5 (link7's local X - confirmed by the user as
                 the correct rotation to fix the gripper's diagonal resting angle; see
                 WRIST_X_JOINT_INDEX's comment). Defaults to the live-calibrated flat/horizontal
@@ -1981,37 +1987,57 @@ def main() -> None:
         if activate_pickup_requested:
             activate_pickup_requested = False
             if args.rollout:
-                active_policy_client = policy_client_pickup
-                active_task = args.task
-                active_policy_client.reset()
-                policy_action_vec = None
-                recorder.task_name = active_task
-                print(f"[rollout] active policy -> PICKUP (task={active_task!r})")
-                if recorder_state is RecorderState.IDLE:
-                    # M alone starts the attempt too - no separate B press needed. Only auto-starts
-                    # from IDLE; if a recording is already in progress (e.g. mid pickup->place
-                    # switch), M/N just swaps the active policy without touching it.
-                    recorder.start()
-                    recorder_state = RecorderState.RECORDING
-                    record_accum = 0.0
-                    episode_start_pos_xy, episode_forward_dir = robot_forward_reference(robot)
-                    print(f"[episode {recorder.episode_index:04d}] recording started")
+                if recorder_state is RecorderState.RECORDING and active_policy_client is policy_client_pickup:
+                    # M pressed again while PICKUP is the one currently running - toggle off, same
+                    # stop transition B uses, so M alone is a full start/stop pair and Y/F/Backspace
+                    # still label it afterward.
+                    recorder_state = RecorderState.AWAITING_LABEL
+                    policy_action_vec = None
+                    print(
+                        f"[episode {recorder.episode_index:04d}] recording stopped "
+                        f"({len(recorder.frames)} frames) - press Y (success) / F (fail) / Backspace (discard)"
+                    )
+                else:
+                    active_policy_client = policy_client_pickup
+                    active_task = args.task
+                    active_policy_client.reset()
+                    policy_action_vec = None
+                    recorder.task_name = active_task
+                    print(f"[rollout] active policy -> PICKUP (task={active_task!r})")
+                    if recorder_state is RecorderState.IDLE:
+                        # M alone starts the attempt too - no separate B press needed. Only
+                        # auto-starts from IDLE; if a recording is already in progress under the
+                        # other policy (place), M just swaps the active policy without stopping it.
+                        recorder.start()
+                        recorder_state = RecorderState.RECORDING
+                        record_accum = 0.0
+                        episode_start_pos_xy, episode_forward_dir = robot_forward_reference(robot)
+                        print(f"[episode {recorder.episode_index:04d}] recording started")
 
         if activate_place_requested:
             activate_place_requested = False
             if args.rollout:
-                active_policy_client = policy_client_place
-                active_task = args.task2
-                active_policy_client.reset()
-                policy_action_vec = None
-                recorder.task_name = active_task
-                print(f"[rollout] active policy -> PLACE (task={active_task!r})")
-                if recorder_state is RecorderState.IDLE:
-                    recorder.start()
-                    recorder_state = RecorderState.RECORDING
-                    record_accum = 0.0
-                    episode_start_pos_xy, episode_forward_dir = robot_forward_reference(robot)
-                    print(f"[episode {recorder.episode_index:04d}] recording started")
+                if recorder_state is RecorderState.RECORDING and active_policy_client is policy_client_place:
+                    # Same M/N-as-toggle behavior as PICKUP above, mirrored for symmetry.
+                    recorder_state = RecorderState.AWAITING_LABEL
+                    policy_action_vec = None
+                    print(
+                        f"[episode {recorder.episode_index:04d}] recording stopped "
+                        f"({len(recorder.frames)} frames) - press Y (success) / F (fail) / Backspace (discard)"
+                    )
+                else:
+                    active_policy_client = policy_client_place
+                    active_task = args.task2
+                    active_policy_client.reset()
+                    policy_action_vec = None
+                    recorder.task_name = active_task
+                    print(f"[rollout] active policy -> PLACE (task={active_task!r})")
+                    if recorder_state is RecorderState.IDLE:
+                        recorder.start()
+                        recorder_state = RecorderState.RECORDING
+                        record_accum = 0.0
+                        episode_start_pos_xy, episode_forward_dir = robot_forward_reference(robot)
+                        print(f"[episode {recorder.episode_index:04d}] recording started")
 
         if record_requested:
             record_requested = False
