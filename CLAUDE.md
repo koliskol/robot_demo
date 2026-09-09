@@ -872,6 +872,18 @@ whether it holds up across the box-jitter range, whether it succeeds reliably vs
 whether the small box also works - only stated as "it works" from watching it grab two of the
 three sizes.
 
+**Follow-up user-run success-rate check, 10 attempts per box size (each presumably a fresh
+`R`-reset drawing a new box-jitter sample, so this does also partially answer the jitter-range
+question above): medium 9/10, big 8/10, small 6/10.** Confirms the checkpoint is reliable, not
+just "worked once," on medium/big, and that it does generalize across at least the default
+jitter range rather than only the one exact pose it was watched succeed on earlier. The small box
+is the clear weak point - notably worse than the other two rather than uniformly good, worth
+keeping in mind before trusting `pickup_policy` on a small object in any downstream use (e.g. a
+future closed-loop eval script or a place_policy handoff). Root cause not yet investigated - could
+be training-data imbalance (if small-box episodes were under-represented in the 71-episode
+dataset), the smaller visual/contact margin making the hug's compression window narrower, or
+something else; not distinguished yet.
+
 **Real usability gap found and fixed**: none of these policies (SmolVLA, ACT, GR00T) predict any
 kind of "done"/termination signal - they're pure behavior-cloning, trained only on "given this
 observation, what's the next action," with episode boundaries decided entirely by whoever was
