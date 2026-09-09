@@ -231,6 +231,21 @@ parser.add_argument(
     "--box-jitter-m. 0 disables yaw jitter.",
 )
 parser.add_argument(
+    "--starting-wrist-x-rad",
+    type=float,
+    default=None,
+    help="Override STARTING_WRIST_X_RAD (default -0.7400, the live-calibrated flat/horizontal "
+    "gripper pose) for this session's launch/reset starting pose and --rollout's pre-first-"
+    "prediction fallback pose. Exists because this default was added 2026-09-08, AFTER "
+    "pickup_policy/place_policy's episodes finished recording (through 2026-09-04) - every frame "
+    "of that data has joint5 (wrist X) exactly 0.0, since no wrist control existed yet at the "
+    "time (confirmed: ARM_OPEN_POSE/ARM_FORWARD_POSE are both 0.0 at that index, and nothing else "
+    "touched it back then). Pass --starting-wrist-x-rad 0.0 when collecting more episodes meant to "
+    "extend one of those existing datasets, so new episodes start from the same pose distribution "
+    "as the old ones instead of silently drifting - leave unset (uses the current calibrated "
+    "default) for any new/independent data collection.",
+)
+parser.add_argument(
     "--seed",
     type=int,
     default=None,
@@ -1752,6 +1767,11 @@ def main() -> None:
         policy_client_place.connect()
         print(f"[rollout] connected to place policy_server.py at {args.policy2_host}:{args.policy2_port} (activate with N)")
 
+    # See --starting-wrist-x-rad's help: overridable so episodes meant to extend
+    # pickup_policy/place_policy's existing (pre-2026-09-08, always-joint5=0) data can match that
+    # starting pose instead of silently drifting onto the newer calibrated default.
+    starting_wrist_x_rad = args.starting_wrist_x_rad if args.starting_wrist_x_rad is not None else STARTING_WRIST_X_RAD
+
     left_arm_swing_rate = arm_swing_rate("left", args.arm_speed)
     right_arm_swing_rate = arm_swing_rate("right", args.arm_speed)
     left_arm_swing_fraction = STARTING_LEFT_ARM_SWING_FRACTION
@@ -1759,7 +1779,7 @@ def main() -> None:
     torso_height_fraction = 0.0
     hand_updown_rad = STARTING_HAND_UPDOWN_RAD
     gripper_rad = 0.0
-    wrist_x_rad = STARTING_WRIST_X_RAD
+    wrist_x_rad = starting_wrist_x_rad
     wrist_y_rad = STARTING_WRIST_Y_RAD
     wrist_z_rad = STARTING_WRIST_Z_RAD
 
@@ -1974,7 +1994,7 @@ def main() -> None:
             torso_height_fraction = 0.0
             hand_updown_rad = STARTING_HAND_UPDOWN_RAD
             gripper_rad = 0.0
-            wrist_x_rad = STARTING_WRIST_X_RAD
+            wrist_x_rad = starting_wrist_x_rad
             wrist_y_rad = STARTING_WRIST_Y_RAD
             wrist_z_rad = STARTING_WRIST_Z_RAD
             record_accum = 0.0
@@ -2199,8 +2219,8 @@ def main() -> None:
                 ) + STARTING_RIGHT_ARM_SWING_FRACTION * np.array(ARM_FORWARD_POSE["right"])
                 left_arm_q[ARM_HAND_UPDOWN_JOINT_INDEX] += STARTING_HAND_UPDOWN_RAD
                 right_arm_q[ARM_HAND_UPDOWN_JOINT_INDEX] += STARTING_HAND_UPDOWN_RAD
-                left_arm_q[WRIST_X_JOINT_INDEX] += STARTING_WRIST_X_RAD
-                right_arm_q[WRIST_X_JOINT_INDEX] += STARTING_WRIST_X_RAD
+                left_arm_q[WRIST_X_JOINT_INDEX] += starting_wrist_x_rad
+                right_arm_q[WRIST_X_JOINT_INDEX] += starting_wrist_x_rad
                 left_arm_q[WRIST_Y_JOINT_INDEX] += STARTING_WRIST_Y_RAD
                 right_arm_q[WRIST_Y_JOINT_INDEX] += STARTING_WRIST_Y_RAD
                 left_arm_q[WRIST_Z_JOINT_INDEX] += STARTING_WRIST_Z_RAD
