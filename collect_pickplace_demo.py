@@ -2212,15 +2212,19 @@ def main() -> None:
             # it's close to the raw spawn pose, with none of the visible ~5s settle-into-position
             # motion teleop mode shows).
             #
-            # recorder_state is not RECORDING (IDLE/AWAITING_LABEL) is a DIFFERENT case from "no
-            # prediction yet" and must not fall into that same settle-pose branch: every stop path
-            # (B, and M/N's own toggle-off) sets policy_action_vec = None specifically to release
-            # the chassis_forward override below, and this arm/torso/gripper logic used to key off
-            # that same None - so pressing M to stop an attempt made the arms swing back toward the
-            # settle pose and the grippers snap open immediately (dropping whatever was held),
-            # instead of freezing in place the way "stop" should. Hold at actual position whenever
-            # not RECORDING, regardless of policy_action_vec.
-            if recorder_state is not RecorderState.RECORDING:
+            # AWAITING_LABEL (the window between stopping and pressing Y/F/Backspace) is a
+            # DIFFERENT case from "no prediction yet" and must not fall into that same settle-pose
+            # branch: every stop path (B, and M/N's own toggle-off) sets policy_action_vec = None
+            # specifically to release the chassis_forward override below, and this arm/torso/
+            # gripper logic used to key off that same None - so pressing M to stop an attempt made
+            # the arms swing back toward the settle pose and the grippers snap open immediately
+            # (dropping whatever was held), instead of freezing in place so the outcome can
+            # actually be seen before labeling it. Deliberately checked as AWAITING_LABEL
+            # specifically, not "not RECORDING" generally - IDLE also means "not RECORDING" (both
+            # at initial launch and after a label/reset), where the settle-pose fallback below is
+            # still the right, intended behavior; an earlier version of this fix used "not
+            # RECORDING" and broke the launch settle animation as a result.
+            if recorder_state is RecorderState.AWAITING_LABEL:
                 left_arm_q = actual_q[left_arm_dof_indices].copy()
                 right_arm_q = actual_q[right_arm_dof_indices].copy()
             elif policy_action_vec is not None:
@@ -2338,8 +2342,8 @@ def main() -> None:
         robot.apply_action(ArticulationAction(joint_positions=right_arm_q, joint_indices=right_arm_dof_indices))
 
         if args.rollout:
-            # Same not-RECORDING-holds-at-actual reasoning as the arms above.
-            if recorder_state is not RecorderState.RECORDING:
+            # Same AWAITING_LABEL-holds-at-actual reasoning as the arms above.
+            if recorder_state is RecorderState.AWAITING_LABEL:
                 torso_q = actual_q[leg_indices].copy()
             else:
                 torso_q = policy_action_vec[14:19].copy() if policy_action_vec is not None else np.array(TORSO_UP_POSE)
@@ -2353,11 +2357,11 @@ def main() -> None:
         robot.apply_action(ArticulationAction(joint_positions=torso_q, joint_indices=leg_indices))
 
         if args.rollout:
-            # Same not-RECORDING-holds-at-actual reasoning as the arms above - critically, this is
+            # Same AWAITING_LABEL-holds-at-actual reasoning as the arms above - critically, this is
             # what stops a stop (B, or M/N's toggle-off) from snapping the grippers open and
             # dropping whatever was being held, which they'd otherwise do since the old "no
             # prediction yet" fallback here was np.array([0.0]) (fully open).
-            if recorder_state is not RecorderState.RECORDING:
+            if recorder_state is RecorderState.AWAITING_LABEL:
                 left_gripper_target = actual_q[left_gripper_dof_indices].copy()
                 right_gripper_target = actual_q[right_gripper_dof_indices].copy()
             elif policy_action_vec is not None:
