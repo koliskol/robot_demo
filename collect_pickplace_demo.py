@@ -23,7 +23,10 @@ stream_demo.py/../Robot_project/capture_cube_rgbd.py:
     W / S       drive forward / backward       (only needed to park/reposition between episodes -
     A / D       strafe left / right             the task itself is fixed-base: no driving is
     Q / E       rotate left / right             recorded as part of an episode's action space)
-    I / K       hold to move torso up / down (leg lift joints)
+    I / K       hold to move torso up / down (leg lift joints). In --rollout mode this stays
+                available whenever no fresh policy prediction is landing that tick (mainly once
+                deactivated via M/N and the pose is frozen) - a fresh prediction still wins over it
+                if a policy happens to be active at the same tick.
     U / O       hold to swing both arms forward / back out to open (shoulder joint only) -
                 this is the hug motion: swinging forward compresses the box between the forearms
     J / L       hold to raise / lower both hands (elbow joint only)
@@ -2355,9 +2358,27 @@ def main() -> None:
         robot.apply_action(ArticulationAction(joint_positions=right_arm_q, joint_indices=right_arm_dof_indices))
 
         if args.rollout:
-            # Same held_*-only-updates-on-a-fresh-prediction reasoning as the arms above.
+            # Same held_*-only-updates-on-a-fresh-prediction reasoning as the arms above, but
+            # torso also allows manual I/K jogging whenever no fresh prediction is overwriting it
+            # this tick - primarily useful once deactivated (M/N toggled off, held_torso_q frozen),
+            # to reposition without waiting on R. I/K are already captured into held_keys
+            # unconditionally (see on_keyboard_event above - only gripper/wrist keys are gated on
+            # `not args.rollout`), they just weren't being read here before. A fresh prediction
+            # still wins over manual jogging if a policy happens to be active at the same tick,
+            # same priority direction as the arms/grippers above (unlike chassis forward/back,
+            # where manual W/S always wins instead - torso doesn't need that stronger guarantee
+            # since jogging it while a policy is actively mid-attempt isn't an expected use case).
             if policy_action_vec is not None:
                 held_torso_q = policy_action_vec[14:19].copy()
+            else:
+                for key in held_keys:
+                    if key in TORSO_HEIGHT_KEYS:
+                        torso_height_fraction += TORSO_HEIGHT_KEYS[key] * args.torso_speed * physics_dt
+                torso_height_fraction = float(np.clip(torso_height_fraction, 0.0, 1.0))
+                if any(key in held_keys for key in TORSO_HEIGHT_KEYS):
+                    held_torso_q = (1.0 - torso_height_fraction) * np.array(TORSO_UP_POSE) + torso_height_fraction * np.array(
+                        TORSO_DOWN_POSE
+                    )
             torso_q = held_torso_q
         else:
             for key in held_keys:
