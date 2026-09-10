@@ -2065,6 +2065,16 @@ def main() -> None:
                         f"({len(recorder.frames)} frames) - press Y (success) / F (fail) / Backspace (discard)"
                     )
                 else:
+                    if recorder_state is RecorderState.AWAITING_LABEL:
+                        # M pressed again to switch policy without labeling the just-stopped
+                        # attempt first - implicitly discard it rather than silently going
+                        # active-but-not-recording (predict()/append() are both gated on
+                        # RECORDING, so leaving state at AWAITING_LABEL here would mean this key
+                        # press does nothing visible, which is exactly the confusing case this
+                        # replaces).
+                        print(f"[rollout] discarding unlabeled attempt ({len(recorder.frames)} frames)")
+                        recorder.discard()
+                        recorder_state = RecorderState.IDLE
                     active_policy_client = policy_client_pickup
                     active_task = args.task
                     active_policy_client.reset()
@@ -2093,6 +2103,12 @@ def main() -> None:
                         f"({len(recorder.frames)} frames) - press Y (success) / F (fail) / Backspace (discard)"
                     )
                 else:
+                    if recorder_state is RecorderState.AWAITING_LABEL:
+                        # Same implicit-discard-on-switch behavior as PICKUP above, mirrored for
+                        # symmetry - see that branch's comment for why.
+                        print(f"[rollout] discarding unlabeled attempt ({len(recorder.frames)} frames)")
+                        recorder.discard()
+                        recorder_state = RecorderState.IDLE
                     active_policy_client = policy_client_place
                     active_task = args.task2
                     active_policy_client.reset()
