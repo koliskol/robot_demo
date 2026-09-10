@@ -884,6 +884,37 @@ be training-data imbalance (if small-box episodes were under-represented in the 
 dataset), the smaller visual/contact margin making the hug's compression window narrower, or
 something else; not distinguished yet.
 
+**Follow-up (2026-09-10): the training-data-imbalance hypothesis above was acted on, not just
+noted.** User-counted split of the original 71-episode `pickup_policy` set was roughly big=31/
+medium=25/small=20 - real imbalance, and it lines up with small being the weak point above.
+Collected 30 more episodes directly targeting the underrepresented sizes (16 small, 14 medium,
+fixed `--cube-scale` instead of `--cube-scale-cycle` so every new episode is the intended size, not
+a 1-in-3 chance of it) - `raw_pickup/` is now 104 episodes (101 success/3 fail), roughly
+big=31/medium=39/small=36, so small and medium are no longer trailing big. One real mistake caught
+before converting: all 30 new episodes were recorded without `--task pickup_policy`, so they landed
+with the auto-derived default task string (`pick_box_table_to_cart`) instead - would have split the
+dataset's language-conditioning across two different task labels for what should be one task. Fixed
+by patching all 30 manifests' `task` field directly (metadata-only, no frames/actions touched) before
+reconverting. `lerobot_dataset_pickup` has been rebuilt from this corrected 104-episode set.
+
+**A retrain on this rebalanced dataset (`pickup_policy_v2`, same 20k-step/batch-8 SmolVLA recipe,
+output `smolvla_training/pickup_policy_v2/`) was started 2026-09-10 and deliberately paused
+partway through for the day, not run to completion** - stopped cleanly (SIGTERM to the main
+`lerobot-train` process, not a kill -9) at step ~8000-9000/20000, loss already down from 1.14 to
+~0.12, tracking the same fast-converge curve the original `pickup_policy`/`place_policy` runs
+showed. A checkpoint exists at `smolvla_training/pickup_policy_v2/checkpoints/008000` (`last`
+symlink points to it), so this resumes rather than restarts:
+
+    conda run -n lerobot lerobot-train \
+        --config_path=./smolvla_training/pickup_policy_v2/checkpoints/last/train_config.json \
+        --resume=true
+
+The original `pickup_policy` checkpoint (`smolvla_training/pickup_policy/checkpoints/020000`,
+trained on the old 74-episode/imbalanced data) is deliberately left in place, not overwritten, so
+once `pickup_policy_v2` finishes it can be compared against - specifically, re-run the same
+10-attempts-per-box-size check from above and see whether small's 6/10 actually improved, not just
+whether loss went down.
+
 **`place_policy` (SmolVLA) has now been fine-tuned the same way, on the already-recorded/already-
 converted `raw_place`/`lerobot_dataset_place` data (50/50 success-labeled episodes, 11,775 frames,
 22-dim schema - this data predates this session and just hadn't been trained on yet).** Same
