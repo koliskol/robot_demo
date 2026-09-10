@@ -906,17 +906,39 @@ eventually trimmed to just its final checkpoint - disk was at 92%/21GB free righ
 finished, tight enough that keeping every checkpoint from a future training run isn't viable
 without trimming as you go.
 
-**Not yet done, deliberately deferred to the next session**: any evaluation of this checkpoint at
-all - no open-loop check, no closed-loop `--rollout` test. Exactly the same caveat this doc already
-applies to every other checkpoint before its first real test: a low training loss says the model
-fits its own training distribution, not that it can actually place a held box onto the target
-successfully. The closed-loop path is already proven end-to-end for `pickup_policy`
-(`policy_server.py` is policy-agnostic, reads the type from the checkpoint's own `config.json`), so
-testing `place_policy` should just mean pointing `policy_server.py --checkpoint-dir` at
-`smolvla_training/place_policy/checkpoints/020000/pretrained_model` and running
-`collect_pickplace_demo.py --rollout` with `N` (place is the second slot, mirroring `M` for
-pickup) - starting from a manually-jogged "already holding the box" pose, per how `place_policy`
-episodes were always recorded (see the two-policy plan above).
+**Closed-loop rollout now attempted live for `place_policy`, and it mostly succeeds** - the first
+real evaluation this checkpoint has had of any kind (no open-loop check was done either). Run via
+`run_policy_inference.py` (not `collect_pickplace_demo.py --rollout`) against `policy_server.py
+--checkpoint-dir smolvla_training/place_policy/checkpoints/020000/pretrained_model` on port 8766
+alongside `pickup_policy`'s server on 8765, starting from a manually-jogged "already holding the
+box" pose per how `place_policy` episodes were always recorded. User-observed result: **place
+succeeded on most attempts** - not yet a formal counted success rate like `pickup_policy`'s 10-per-
+box-size check above, so treat "mostly" as a qualitative first read, not a number to cite. A
+proper per-box-size or per-jitter-range count is the natural next step if this checkpoint is going
+to be relied on, same as was done for `pickup_policy`.
+
+`run_policy_inference.py` (not `collect_pickplace_demo.py --rollout`) was the right tool for this
+test, for a reason worth remembering: it was forked from `collect_pickplace_demo.py` on 2026-09-04,
+*before* the wrist-flattening calibration (`STARTING_WRIST_X_RAD`, added 2026-09-08) existed - its
+`idle_arm_pose()` takes no wrist parameter at all, so it starts from wrist joint5=0.0, which is
+exactly the pose distribution `pickup_policy`/`place_policy` were both recorded under (see that
+flag's own help text). Running these two checkpoints through `collect_pickplace_demo.py --rollout`
+instead requires remembering to pass `--starting-wrist-x-rad 0.0` explicitly, or the gripper starts
+from the wrong pose relative to training data - confirmed live as a real failure mode (reported as
+"the gripper position is wrong again, not similar with the dataset") before switching to
+`run_policy_inference.py` sidestepped it entirely. `run_policy_inference.py` is otherwise stale
+relative to `collect_pickplace_demo.py` (no `JOINT_EFFORT_LIMIT_NM` wrist compliance, e.g.) - fine
+for pick/place, since that mechanism was added for the unrelated pushcart-grip instability.
+
+**A related `collect_pickplace_demo.py --rollout`-only bug was found and fixed along the way**:
+pressing `M` then `M` again (stop) left the recorder in `AWAITING_LABEL`; pressing `N` from there
+silently set `active_policy_client` to place without restarting recording (the auto-start check
+only fired from `IDLE`), since `predict()`/`recorder.append()` are both gated on `RECORDING` - so
+the key press appeared to do nothing, with a misleading "active policy -> PLACE" print alongside.
+Fixed (`0d56839`) by having `M`/`N` auto-discard the pending unlabeled attempt when pressed from
+`AWAITING_LABEL`, instead of requiring an explicit `Y`/`F`/`Backspace` first - `Y`/`F`/`Backspace`
+still work exactly as before when you do want to label explicitly. Doesn't affect
+`run_policy_inference.py`, which has no labeling state machine to get stuck in.
 
 **Real usability gap found and fixed**: none of these policies (SmolVLA, ACT, GR00T) predict any
 kind of "done"/termination signal - they're pure behavior-cloning, trained only on "given this
