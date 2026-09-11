@@ -915,6 +915,17 @@ once `pickup_policy_v2` finishes it can be compared against - specifically, re-r
 10-attempts-per-box-size check from above and see whether small's 6/10 actually improved, not just
 whether loss went down.
 
+**`pickup_policy_v2` was resumed and run to completion on 2026-09-11.** One correction to the
+resume command above: `train_config.json` actually lives under the checkpoint's `pretrained_model/`
+subdirectory, not directly in the checkpoint dir - `--config_path=./smolvla_training/
+pickup_policy_v2/checkpoints/last/pretrained_model/train_config.json`. The remaining 12,000 steps
+(8000 -> 20000) took ~1 hour wall-clock, same throughput as the original run. Final loss at step
+20K: **0.034** - same converge-then-plateau pattern as `pickup_policy`/`place_policy`. Kept only
+the final `020000` checkpoint (`last` symlink), trimmed the four intermediates (~4.5GB) same as
+prior runs. **Not yet done**: the 10-attempts-per-box-size comparison against the original
+`pickup_policy` checkpoint - loss being lower doesn't by itself confirm small-box picking actually
+improved, same caveat this doc applies to every checkpoint before its first real evaluation.
+
 **`place_policy` (SmolVLA) has now been fine-tuned the same way, on the already-recorded/already-
 converted `raw_place`/`lerobot_dataset_place` data (50/50 success-labeled episodes, 11,775 frames,
 22-dim schema - this data predates this session and just hadn't been trained on yet).** Same
